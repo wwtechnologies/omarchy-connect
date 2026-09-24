@@ -4,7 +4,7 @@ use std::sync::mpsc::{sync_channel, Receiver};
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
+    self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
 };
 use omarchy_protocol::{keys, InputEvent};
 use tokio::sync::mpsc::unbounded_channel;
@@ -42,7 +42,7 @@ pub fn run_gui(launch: GuiLaunch) -> anyhow::Result<()> {
     let size = if app.session.is_some() {
         [1180.0, 720.0]
     } else {
-        [520.0, 420.0]
+        [640.0, 560.0]
     };
     options.viewport = egui::ViewportBuilder::default()
         .with_inner_size(size)
@@ -120,7 +120,7 @@ impl eframe::App for Shell {
             if let Some(session) = self.session.take() {
                 let _ = session.commands.send(ClientCommand::Disconnect);
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(520.0, 420.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(640.0, 560.0)));
         }
         if self.session.is_some() {
             eframe::App::update(self.session.as_mut().unwrap(), ctx, frame);
@@ -132,66 +132,83 @@ impl eframe::App for Shell {
 
 impl Shell {
     fn connect_form(&mut self, ctx: &egui::Context) {
-        let amber = Color32::from_rgb(232, 168, 56);
         let mut connect = false;
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(36.0);
-            ui.vertical_centered(|ui| {
-                ui.colored_label(
-                    amber,
-                    egui::RichText::new("Omarchy Connect").size(28.0),
-                );
-                ui.add_space(6.0);
-                ui.label("Type the IP address printed on your Omarchy machine.");
-            });
-            ui.add_space(28.0);
-            let width = 360.0;
-            let left = ((ui.available_width() - width) * 0.5).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(left);
-                ui.vertical(|ui| {
-                    ui.set_width(width);
-                    ui.label("Omarchy IP");
-                    let host = ui.add(
-                        egui::TextEdit::singleline(&mut self.host_text)
-                            .hint_text("192.168.1.10")
-                            .desired_width(width)
-                            .font(FontId::proportional(18.0)),
-                    );
-                    if !self.focused {
-                        host.request_focus();
-                        self.focused = true;
-                    }
-                    ui.add_space(4.0);
+            let avail = ui.available_rect_before_wrap();
+            let card = Rect::from_center_size(
+                avail.center(),
+                Vec2::new(440.0, 460.0).min(avail.size() - Vec2::splat(32.0)),
+            );
+            ui.painter().rect_filled(card, CornerRadius::same(18), Theme::LIFT);
+            ui.painter().rect_stroke(
+                card,
+                CornerRadius::same(18),
+                Stroke::new(1.0_f32, Theme::LINE),
+                StrokeKind::Inside,
+            );
+            let inner = card.shrink(28.0);
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 5.0, Theme::ACCENT);
+                    ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("Port 47921 is used when you leave it off.")
+                        egui::RichText::new("OMARCHY")
                             .size(12.0)
-                            .color(Color32::from_rgb(160, 152, 140)),
+                            .color(Theme::MUTED)
+                            .strong(),
                     );
-                    ui.add_space(14.0);
-                    ui.label("Pin");
-                    let pin = ui.add(
-                        egui::TextEdit::singleline(&mut self.pin_text)
-                            .hint_text("SHA-256 pin from the host")
-                            .desired_width(width)
-                            .font(FontId::monospace(14.0)),
-                    );
-                    ui.add_space(18.0);
-                    let button = ui.add_sized(
-                        [width, 36.0],
-                        egui::Button::new(egui::RichText::new("Connect").size(16.0)),
-                    );
-                    connect = button.clicked()
-                        || (host.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        || (pin.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    if !self.form_error.is_empty() {
-                        ui.add_space(12.0);
-                        ui.colored_label(
-                            Color32::from_rgb(220, 96, 72),
-                            egui::RichText::new(&self.form_error).size(14.0),
-                        );
-                    }
                 });
+                ui.add_space(18.0);
+                ui.label(egui::RichText::new("Connect").size(32.0).color(Theme::FG).strong());
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("The address of your Omarchy machine on this network.")
+                        .size(14.0)
+                        .color(Theme::SOFT),
+                );
+                ui.add_space(22.0);
+                field_label(ui, "Host");
+                let host = ui.add(
+                    egui::TextEdit::singleline(&mut self.host_text)
+                        .hint_text("192.168.1.10")
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(12, 10))
+                        .font(FontId::proportional(16.0)),
+                );
+                if !self.focused {
+                    host.request_focus();
+                    self.focused = true;
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Port 47921 if you leave it off")
+                        .size(12.0)
+                        .color(Theme::MUTED),
+                );
+                ui.add_space(14.0);
+                field_label(ui, "Pin");
+                let pin = ui.add(
+                    egui::TextEdit::singleline(&mut self.pin_text)
+                        .hint_text("SHA-256 from the host")
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(12, 10))
+                        .font(FontId::monospace(14.0)),
+                );
+                ui.add_space(20.0);
+                let button = ui.add_sized(
+                    [ui.available_width(), 40.0],
+                    egui::Button::new(egui::RichText::new("Connect").size(16.0).strong())
+                        .fill(Theme::ACCENT)
+                        .corner_radius(CornerRadius::same(10)),
+                );
+                connect = button.clicked()
+                    || (host.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || (pin.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if !self.form_error.is_empty() {
+                    ui.add_space(12.0);
+                    ui.colored_label(Theme::RED, egui::RichText::new(&self.form_error).size(13.0));
+                }
             });
         });
         if connect {
@@ -266,8 +283,8 @@ struct ClientApp {
     shift: bool,
     ctrl: bool,
     alt: bool,
-        frame_count: u32,
-        leave: bool,
+    frame_count: u32,
+    leave: bool,
 }
 
 impl eframe::App for ClientApp {
@@ -277,43 +294,70 @@ impl eframe::App for ClientApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain(ctx);
-        let amber = Color32::from_rgb(232, 168, 56);
-        egui::TopBottomPanel::top("status").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(amber, "Omarchy Connect");
-                ui.label(&self.status);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Change host").clicked() {
-                        self.leave = true;
-                    }
-                    ui.label(format!("{} frames", self.frame_count));
+        egui::TopBottomPanel::top("status")
+            .frame(bar_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (mark, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(mark, CornerRadius::same(2), Theme::ACCENT);
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Omarchy").strong().color(Theme::FG));
+                    ui.label(
+                        egui::RichText::new(&self.status)
+                            .size(13.0)
+                            .color(Theme::SOFT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("Change host")
+                                    .corner_radius(CornerRadius::same(8)),
+                            )
+                            .clicked()
+                        {
+                            self.leave = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{} frames", self.frame_count))
+                                .size(12.0)
+                                .color(Theme::MUTED),
+                        );
+                    });
                 });
             });
-            ui.add_space(6.0);
-        });
         let mut path_id = None;
-        egui::TopBottomPanel::bottom("files").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Send");
-                let editor = ui.add(
-                    egui::TextEdit::singleline(&mut self.send_path)
-                        .hint_text("Path on this machine")
-                        .desired_width(320.0),
-                );
-                path_id = Some(editor.id);
-                if ui.button("Send file").clicked() {
-                    let path = PathBuf::from(self.send_path.trim());
-                    if !path.as_os_str().is_empty() {
-                        ctx.memory_mut(|mem| mem.surrender_focus(editor.id));
-                        let _ = self.commands.send(ClientCommand::SendFile(path));
+        egui::TopBottomPanel::bottom("files")
+            .frame(bar_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Send").color(Theme::SOFT));
+                    let editor = ui.add(
+                        egui::TextEdit::singleline(&mut self.send_path)
+                            .hint_text("Path on this machine")
+                            .desired_width(320.0)
+                            .margin(egui::Margin::symmetric(10, 6)),
+                    );
+                    path_id = Some(editor.id);
+                    if ui
+                        .add(
+                            egui::Button::new("Send file").corner_radius(CornerRadius::same(8)),
+                        )
+                        .clicked()
+                    {
+                        let path = PathBuf::from(self.send_path.trim());
+                        if !path.as_os_str().is_empty() {
+                            ctx.memory_mut(|mem| mem.surrender_focus(editor.id));
+                            let _ = self.commands.send(ClientCommand::SendFile(path));
+                        }
                     }
-                }
-                ui.label(&self.file_status);
+                    ui.label(
+                        egui::RichText::new(&self.file_status)
+                            .size(12.0)
+                            .color(Theme::MUTED),
+                    );
+                });
             });
-            ui.add_space(6.0);
-        });
         egui::CentralPanel::default().show(ctx, |ui| {
             self.paint_displays(ui);
         });
@@ -400,7 +444,6 @@ impl ClientApp {
             );
         self.hits.clear();
         self.hovered = None;
-        let amber = Color32::from_rgb(232, 168, 56);
         for display in &self.displays {
             let x = origin.x + (display.x - min_x) as f32 * scale;
             let y = origin.y + (display.y - min_y) as f32 * scale;
@@ -426,24 +469,33 @@ impl ClientApp {
                 );
             } else {
                 ui.painter()
-                    .rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(12, 11, 10));
+                    .rect_filled(rect, CornerRadius::same(8), Theme::BG_DARK);
             }
             ui.painter().rect_stroke(
                 rect,
-                CornerRadius::ZERO,
-                Stroke::new(1.0_f32, amber),
+                CornerRadius::same(8),
+                Stroke::new(1.5_f32, Theme::ACCENT),
                 StrokeKind::Inside,
             );
             let label = format!(
                 "{}    {}×{}    {}%",
                 display.name, display.width, display.height, display.scale_percent
             );
-            ui.painter().text(
-                rect.left_top() + Vec2::new(8.0, 6.0),
-                Align2::LEFT_TOP,
+            let galley = ui.painter().layout_no_wrap(
                 label,
-                FontId::proportional(13.0),
-                Color32::from_rgb(236, 230, 218),
+                FontId::proportional(12.0),
+                Theme::FG,
+            );
+            let chip = Rect::from_min_size(
+                rect.left_top() + Vec2::new(8.0, 8.0),
+                galley.size() + Vec2::new(16.0, 8.0),
+            );
+            ui.painter()
+                .rect_filled(chip, CornerRadius::same(6), Theme::BG_DARK.gamma_multiply(0.92));
+            ui.painter().galley(
+                chip.left_top() + Vec2::new(8.0, 4.0),
+                galley,
+                Theme::FG,
             );
             self.hits.push((display.clone(), rect));
         }
@@ -579,21 +631,72 @@ fn pixel(display: &omarchy_protocol::DisplayInfo, rect: Rect, pos: Pos2) -> (u32
     )
 }
 
+/// Tokyo Night, the palette Omarchy ships as its default theme.
+struct Theme;
+
+impl Theme {
+    const BG: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x26);
+    const BG_DARK: Color32 = Color32::from_rgb(0x13, 0x14, 0x1c);
+    const LIFT: Color32 = Color32::from_rgb(0x24, 0x28, 0x3b);
+    const LINE: Color32 = Color32::from_rgb(0x41, 0x48, 0x68);
+    const FG: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
+    const SOFT: Color32 = Color32::from_rgb(0xa9, 0xb1, 0xd6);
+    const MUTED: Color32 = Color32::from_rgb(0x56, 0x5f, 0x89);
+    const ACCENT: Color32 = Color32::from_rgb(0x7a, 0xa2, 0xf7);
+    const RED: Color32 = Color32::from_rgb(0xf7, 0x76, 0x8e);
+}
+
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(12.0)
+            .color(Theme::SOFT)
+            .strong(),
+    );
+    ui.add_space(6.0);
+}
+
+fn bar_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Theme::BG_DARK)
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .stroke(Stroke::new(1.0_f32, Theme::LINE))
+}
+
+fn round_widget(widget: &mut egui::style::WidgetVisuals, radius: u8) {
+    widget.corner_radius = CornerRadius::same(radius);
+}
+
 fn visuals() -> egui::Visuals {
     let mut visuals = egui::Visuals::dark();
-    let ink = Color32::from_rgb(236, 230, 218);
-    let amber = Color32::from_rgb(232, 168, 56);
-    visuals.panel_fill = Color32::from_rgb(22, 21, 18);
-    visuals.window_fill = Color32::from_rgb(32, 30, 26);
-    visuals.extreme_bg_color = Color32::from_rgb(16, 15, 13);
-    visuals.faint_bg_color = Color32::from_rgb(38, 35, 30);
-    visuals.widgets.noninteractive.fg_stroke.color = ink;
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(48, 43, 36);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(72, 58, 32);
-    visuals.widgets.active.bg_fill = amber;
-    visuals.widgets.active.fg_stroke.color = Color32::from_rgb(22, 21, 18);
-    visuals.selection.bg_fill = amber;
-    visuals.selection.stroke.color = Color32::from_rgb(22, 21, 18);
-    visuals.hyperlink_color = amber;
+    visuals.panel_fill = Theme::BG;
+    visuals.window_fill = Theme::LIFT;
+    visuals.extreme_bg_color = Theme::BG_DARK;
+    visuals.faint_bg_color = Theme::LIFT;
+    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.menu_corner_radius = CornerRadius::same(10);
+    visuals.widgets.noninteractive.fg_stroke.color = Theme::FG;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, Theme::LINE);
+    visuals.widgets.inactive.bg_fill = Theme::BG_DARK;
+    visuals.widgets.inactive.fg_stroke.color = Theme::FG;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Theme::LINE);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x2f, 0x35, 0x4d);
+    visuals.widgets.hovered.fg_stroke.color = Theme::FG;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Theme::ACCENT);
+    visuals.widgets.active.bg_fill = Theme::ACCENT;
+    visuals.widgets.active.fg_stroke.color = Theme::BG_DARK;
+    visuals.widgets.open.bg_fill = Theme::LIFT;
+    visuals.selection.bg_fill = Theme::ACCENT;
+    visuals.selection.stroke.color = Theme::BG_DARK;
+    visuals.hyperlink_color = Theme::ACCENT;
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        round_widget(widget, 8);
+    }
     visuals
 }
