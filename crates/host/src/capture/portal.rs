@@ -23,12 +23,12 @@ use omarchy_protocol::DisplayInfo;
 use pipewire as pw;
 use pw::spa;
 
-use crate::capture::RawFrame;
+use crate::capture::{FrameInbox, RawFrame};
 use crate::yuv::{self, PixelOrder};
 
 pub struct PortalCapture {
     pub displays: Vec<DisplayInfo>,
-    frames: Option<tokio::sync::mpsc::Receiver<RawFrame>>,
+    frames: Option<FrameInbox>,
     stop: Arc<AtomicBool>,
     session: Option<ashpd::desktop::Session<'static, Screencast<'static>>>,
     _screencast: Screencast<'static>,
@@ -46,7 +46,7 @@ impl Drop for PortalCapture {
 }
 
 impl PortalCapture {
-    pub fn take_frames(&mut self) -> tokio::sync::mpsc::Receiver<RawFrame> {
+    pub fn take_frames(&mut self) -> FrameInbox {
         self.frames.take().expect("portal frames taken once")
     }
 }
@@ -111,16 +111,18 @@ async fn start_screencast(
         .context("open pipewire remote")?;
 
     let (displays, targets) = displays_from_streams(&streams);
-    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(2);
+    let frame_tx = FrameInbox::new();
+    let frame_rx = frame_tx.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
 
     std::thread::Builder::new()
         .name("omarchy-pipewire".into())
         .spawn(move || {
-            if let Err(err) = pipewire_thread(fd, targets, frame_tx, stop_thread) {
+            if let Err(err) = pipewire_thread(fd, targets, frame_tx.clone(), stop_thread) {
                 tracing::error!(error = %err, "pipewire capture ended");
             }
+            frame_tx.close();
         })
         .context("spawn pipewire thread")?;
 
@@ -193,7 +195,7 @@ fn displays_from_streams(streams: &[PortalStream]) -> (Vec<DisplayInfo>, Vec<Str
 fn pipewire_thread(
     fd: OwnedFd,
     targets: Vec<StreamTarget>,
-    tx: tokio::sync::mpsc::Sender<RawFrame>,
+    tx: FrameInbox,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -268,7 +270,7 @@ fn pipewire_thread(
                     }
                     return;
                 };
-                let _ = user.tx.try_send(frame);
+                user.tx.publish(frame);
             })
             .register()
             .context("pipewire listener")?;
@@ -306,7 +308,7 @@ fn pipewire_thread(
 struct StreamData {
     display_id: u32,
     format: spa::param::video::VideoInfoRaw,
-    tx: tokio::sync::mpsc::Sender<RawFrame>,
+    tx: FrameInbox,
     announced: bool,
 }
 

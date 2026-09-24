@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
@@ -11,7 +11,7 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::keys::evdev_code;
 use crate::net::{
-    parse_host, parse_pin, run_session, ClientCommand, SessionConfig, UiEvent, UiSink, VideoFrame,
+    parse_host, parse_pin, run_session, ClientCommand, FrameSlot, SessionConfig, UiEvent, UiSink,
 };
 
 pub struct GuiLaunch {
@@ -60,11 +60,11 @@ pub fn run_gui(launch: GuiLaunch) -> anyhow::Result<()> {
 }
 
 fn spawn_session(config: SessionConfig) -> ClientApp {
-    let (frame_tx, frame_rx) = sync_channel(2);
+    let frames = FrameSlot::new();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let sink = UiSink {
-        frames: frame_tx,
+        frames: frames.clone(),
         events: event_tx.clone(),
     };
     std::thread::spawn(move || {
@@ -80,7 +80,7 @@ fn spawn_session(config: SessionConfig) -> ClientApp {
         }
     });
     ClientApp {
-        frames: frame_rx,
+        frames,
         events: event_rx,
         commands: cmd_tx,
         status: "Starting".into(),
@@ -289,7 +289,7 @@ fn save_host(host: &str) {
 }
 
 struct ClientApp {
-    frames: Receiver<VideoFrame>,
+    frames: FrameSlot,
     events: Receiver<UiEvent>,
     commands: tokio::sync::mpsc::UnboundedSender<ClientCommand>,
     status: String,
@@ -397,7 +397,7 @@ impl eframe::App for ClientApp {
 
 impl ClientApp {
     fn drain(&mut self, ctx: &egui::Context) {
-        while let Ok(frame) = self.frames.try_recv() {
+        for frame in self.frames.take() {
             self.fps_frames = self.fps_frames.saturating_add(1);
             let elapsed = self.fps_at.elapsed();
             if elapsed >= Duration::from_secs(1) {

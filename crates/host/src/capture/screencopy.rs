@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use omarchy_protocol::DisplayInfo;
-use tokio::sync::mpsc;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
@@ -24,7 +23,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
 
-use crate::capture::RawFrame;
+use crate::capture::{FrameInbox, RawFrame};
 use crate::input::Region;
 use crate::yuv::{self, PixelOrder};
 
@@ -34,7 +33,7 @@ const ROUND_TIMEOUT: Duration = Duration::from_millis(500);
 pub struct ScreencopyCapture {
     pub displays: Vec<DisplayInfo>,
     pub regions: Vec<Region>,
-    frames: Option<mpsc::Receiver<RawFrame>>,
+    frames: Option<FrameInbox>,
     stop: Arc<AtomicBool>,
 }
 
@@ -45,12 +44,12 @@ impl Drop for ScreencopyCapture {
 }
 
 impl ScreencopyCapture {
-    pub fn take_frames(&mut self) -> mpsc::Receiver<RawFrame> {
+    pub fn take_frames(&mut self) -> FrameInbox {
         self.frames.take().expect("screencopy frames taken once")
     }
 }
 
-type Setup = anyhow::Result<(Vec<DisplayInfo>, Vec<Region>, mpsc::Receiver<RawFrame>)>;
+type Setup = anyhow::Result<(Vec<DisplayInfo>, Vec<Region>, FrameInbox)>;
 
 pub async fn open_screencopy(fps: u32) -> anyhow::Result<ScreencopyCapture> {
     let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<Setup>();
@@ -67,13 +66,15 @@ pub async fn open_screencopy(fps: u32) -> anyhow::Result<ScreencopyCapture> {
                 }
             };
             let (displays, regions) = grabber.layout();
-            let (tx, rx) = mpsc::channel(2 * displays.len().max(1));
+            let tx = FrameInbox::new();
+            let rx = tx.clone();
             if setup_tx.send(Ok((displays, regions, rx))).is_err() {
                 return;
             }
-            if let Err(err) = grabber.run(fps, tx, stop_thread) {
+            if let Err(err) = grabber.run(fps, tx.clone(), stop_thread) {
                 tracing::error!(error = %err, "screencopy capture ended");
             }
+            tx.close();
         })
         .context("spawn screencopy thread")?;
     let (displays, regions, frames) = setup_rx.await.context("screencopy thread ended")??;
@@ -273,7 +274,7 @@ impl Grabber {
     fn run(
         &mut self,
         fps: u32,
-        tx: mpsc::Sender<RawFrame>,
+        tx: FrameInbox,
         stop: Arc<AtomicBool>,
     ) -> anyhow::Result<()> {
         let interval = Duration::from_secs(1) / fps.max(1);
@@ -284,18 +285,8 @@ impl Grabber {
             .map(|d| (d.id as usize, d.width, d.height))
             .collect();
         while !stop.load(Ordering::Relaxed) {
-            if tx.is_closed() {
-                break;
-            }
             let started = Instant::now();
-            if tx.capacity() >= ids.len() {
-                self.round()?;
-                for &(index, width, height) in &ids {
-                    if let Some(frame) = self.frame(index, width, height) {
-                        let _ = tx.try_send(frame);
-                    }
-                }
-            }
+            self.round_send(&ids, &tx)?;
             if let Some(rest) = interval.checked_sub(started.elapsed()) {
                 std::thread::sleep(rest);
             }
@@ -303,23 +294,24 @@ impl Grabber {
         Ok(())
     }
 
-    /// Asks every output for one frame and waits for all of them.
-    fn round(&mut self) -> anyhow::Result<()> {
+    /// Asks every output for one frame and publishes each as soon as it is ready.
+    fn round_send(&mut self, ids: &[(usize, u32, u32)], tx: &FrameInbox) -> anyhow::Result<()> {
         for (index, output) in self.state.outputs.iter_mut().enumerate() {
             output.pending = Pending::Waiting;
             output.frame = Some(self.manager.capture_output(1, &output.wl, &self.qh, index));
         }
         let deadline = Instant::now() + ROUND_TIMEOUT;
-        while self
-            .state
-            .outputs
-            .iter()
-            .any(|o| o.pending == Pending::Waiting)
-        {
+        let mut sent = vec![false; self.state.outputs.len()];
+        while sent.iter().any(|done| !done) {
+            self.publish_ready(ids, tx, &mut sent);
+            if sent.iter().all(|done| *done) {
+                break;
+            }
             if !self.dispatch_until(deadline)? {
                 break;
             }
         }
+        self.publish_ready(ids, tx, &mut sent);
         for output in &mut self.state.outputs {
             if output.pending == Pending::Waiting {
                 output.pending = Pending::Failed;
@@ -329,6 +321,27 @@ impl Grabber {
             }
         }
         Ok(())
+    }
+
+    fn publish_ready(&mut self, ids: &[(usize, u32, u32)], tx: &FrameInbox, sent: &mut [bool]) {
+        for &(index, width, height) in ids {
+            if sent.get(index).copied().unwrap_or(true) {
+                continue;
+            }
+            if self.state.outputs.get(index).map(|o| o.pending) != Some(Pending::Ready) {
+                if self.state.outputs.get(index).map(|o| o.pending) == Some(Pending::Failed) {
+                    sent[index] = true;
+                }
+                continue;
+            }
+            if let Some(frame) = self.frame(index, width, height) {
+                tx.publish(frame);
+            }
+            if let Some(output) = self.state.outputs.get_mut(index) {
+                output.pending = Pending::Failed;
+            }
+            sent[index] = true;
+        }
     }
 
     /// Dispatches events until something arrives or the deadline passes.

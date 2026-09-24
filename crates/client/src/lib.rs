@@ -13,6 +13,6 @@ mod tls;
 pub use app::run_gui;
 pub use app::GuiLaunch;
 pub use net::{
-    parse_host, parse_pin, run_session, ClientCommand, SessionConfig, SessionReport, UiEvent,
-    UiSink, VideoFrame, DEFAULT_PORT,
+    parse_host, parse_pin, run_session, ClientCommand, FrameSlot, SessionConfig, SessionReport,
+    UiEvent, UiSink, VideoFrame, DEFAULT_PORT,
 };

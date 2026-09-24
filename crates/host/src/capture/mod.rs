@@ -12,6 +12,11 @@ pub use portal::{default_token_path, open_portal, PortalCapture};
 #[cfg(target_os = "linux")]
 pub use screencopy::{open_screencopy, ScreencopyCapture};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::Notify;
+
 use crate::input::Cursor;
 
 #[derive(Debug)]
@@ -20,6 +25,53 @@ pub struct RawFrame {
     pub width: u32,
     pub height: u32,
     pub i420: Vec<u8>,
+}
+
+/// One slot per monitor. A new capture replaces the previous one, so the
+/// encoder never spends time on a picture the client will only see late.
+#[derive(Clone)]
+pub struct FrameInbox {
+    slots: Arc<Mutex<Vec<RawFrame>>>,
+    notify: Arc<Notify>,
+    closed: Arc<AtomicBool>,
+}
+
+impl FrameInbox {
+    pub fn new() -> Self {
+        Self {
+            slots: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    pub fn publish(&self, frame: RawFrame) {
+        let mut slots = self.slots.lock().expect("frame inbox");
+        if let Some(slot) = slots.iter_mut().find(|item| item.display_id == frame.display_id) {
+            *slot = frame;
+        } else {
+            slots.push(frame);
+        }
+        drop(slots);
+        self.notify.notify_one();
+    }
+
+    pub async fn recv(&self) -> Option<RawFrame> {
+        loop {
+            if let Some(frame) = self.slots.lock().expect("frame inbox").pop() {
+                return Some(frame);
+            }
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 pub fn cursor_handle() -> std::sync::Arc<std::sync::Mutex<Cursor>> {
@@ -91,7 +143,7 @@ impl LiveCapture {
         }
     }
 
-    pub fn take_frames(&mut self) -> tokio::sync::mpsc::Receiver<RawFrame> {
+    pub fn take_frames(&mut self) -> FrameInbox {
         match self {
             Self::Screencopy(capture) => capture.take_frames(),
             Self::Portal(capture) => capture.take_frames(),

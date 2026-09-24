@@ -270,7 +270,7 @@ async fn handle_client(
 
     let (reader, mut writer) = split(tls);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Message>(32);
-    let (video_tx, mut video_rx) = mpsc::channel::<Message>(2);
+    let (video_tx, mut video_rx) = mpsc::channel::<Message>(1);
     let session_cancel = session_cancel.clone();
 
     let writer_cancel = session_cancel.clone();
@@ -279,13 +279,13 @@ async fn handle_client(
             tokio::select! {
                 biased;
                 _ = writer_cancel.cancelled() => break,
-                msg = ctrl_rx.recv() => {
+                msg = video_rx.recv() => {
                     let Some(msg) = msg else { break };
                     if write_message(&mut writer, &msg).await.is_err() {
                         break;
                     }
                 }
-                msg = video_rx.recv() => {
+                msg = ctrl_rx.recv() => {
                     let Some(msg) = msg else { break };
                     if write_message(&mut writer, &msg).await.is_err() {
                         break;
@@ -300,7 +300,7 @@ async fn handle_client(
     let cursor = capture::cursor_handle();
     let displays;
     let injector;
-    let mut live_frames: Option<tokio::sync::mpsc::Receiver<RawFrame>> = None;
+    let mut live_frames: Option<capture::FrameInbox> = None;
     // Dropping this sets the PipeWire stop flag. It has to outlive the frame loop.
     #[cfg(target_os = "linux")]
     let mut capture_guard: Option<capture::LiveCapture> = None;
@@ -463,7 +463,7 @@ async fn drive_session(
     cursor: Arc<Mutex<Cursor>>,
     mut displays: Vec<DisplayInfo>,
     injector: Injector,
-    mut live_frames: Option<tokio::sync::mpsc::Receiver<RawFrame>>,
+    mut live_frames: Option<capture::FrameInbox>,
 ) -> anyhow::Result<()> {
     ctrl_tx
         .send(Message::Displays {
@@ -574,9 +574,7 @@ async fn drive_session(
     Ok(())
 }
 
-async fn recv_live(
-    frames: &mut Option<tokio::sync::mpsc::Receiver<RawFrame>>,
-) -> Option<RawFrame> {
+async fn recv_live(frames: &mut Option<capture::FrameInbox>) -> Option<RawFrame> {
     match frames {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -606,8 +604,9 @@ async fn send_frame(
             keyframe: packet.keyframe,
             data: packet.data,
         };
-        if video_tx.try_send(msg).is_err() {
-            // The writer is behind. Drop the frame so latency stays bounded.
+        // Blocking keeps the H.264 sequence intact. The capture side already
+        // replaced any older picture, so this wait is one frame, not a backlog.
+        if video_tx.send(msg).await.is_err() {
             break;
         }
     }

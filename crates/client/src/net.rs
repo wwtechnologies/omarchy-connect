@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Sender, SyncSender};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use omarchy_protocol::auth::{PinExchange, Side, TLS_EXPORTER_LABEL};
@@ -79,9 +80,36 @@ pub enum ClientCommand {
     Disconnect,
 }
 
+/// Latest decoded picture per monitor. A newer frame replaces an older one
+/// that the window has not painted yet.
 #[derive(Clone)]
+pub struct FrameSlot {
+    inner: Arc<Mutex<Vec<VideoFrame>>>,
+}
+
+impl FrameSlot {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn publish(&self, frame: VideoFrame) {
+        let mut slots = self.inner.lock().expect("frame slot");
+        if let Some(slot) = slots.iter_mut().find(|item| item.display_id == frame.display_id) {
+            *slot = frame;
+        } else {
+            slots.push(frame);
+        }
+    }
+
+    pub fn take(&self) -> Vec<VideoFrame> {
+        std::mem::take(&mut *self.inner.lock().expect("frame slot"))
+    }
+}
+
 pub struct UiSink {
-    pub frames: SyncSender<VideoFrame>,
+    pub frames: FrameSlot,
     pub events: Sender<UiEvent>,
 }
 
@@ -241,7 +269,9 @@ async fn session(
     // read_message is not cancellation-safe. A mouse event in select! would
     // drop bytes already taken from the TLS stream and the next length would
     // be garbage ("frame length ... is outside 1..=8388608").
-    let (incoming_tx, mut incoming_rx) = mpsc::channel(8);
+    // One slot. A deeper queue means we decode frames the screen will never
+    // show, and the picture falls further behind the host.
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(1);
     let reader_task = tokio::spawn(async move {
         loop {
             match read_message(&mut reader).await {
@@ -264,6 +294,22 @@ async fn session(
     loop {
         tokio::select! {
             biased;
+            // Frames before mouse moves. A steady pointer stream used to sit
+            // in front of video, so the picture lagged even when it had arrived.
+            incoming = incoming_rx.recv() => {
+                let msg = match incoming {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(ProtocolError::Closed)) | None => break,
+                    Some(Err(err)) => {
+                        closed = err.to_string();
+                        break;
+                    }
+                };
+                if handle_message(&mut live, &mut decoders, &ctrl_tx, ui, config, msg).await? {
+                    closed = "session complete".into();
+                    break;
+                }
+            }
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else {
                     closed = "client closed".into();
@@ -286,20 +332,6 @@ async fn session(
                             emit(ui, UiEvent::Status(format!("send failed: {err}")));
                         }
                     }
-                }
-            }
-            incoming = incoming_rx.recv() => {
-                let msg = match incoming {
-                    Some(Ok(msg)) => msg,
-                    Some(Err(ProtocolError::Closed)) | None => break,
-                    Some(Err(err)) => {
-                        closed = err.to_string();
-                        break;
-                    }
-                };
-                if handle_message(&mut live, &mut decoders, &ctrl_tx, ui, config, msg).await? {
-                    closed = "session complete".into();
-                    break;
                 }
             }
         }
@@ -350,7 +382,7 @@ async fn handle_message(
                     note_motion(live, display_id, &frame.rgba);
                     live.frames_decoded = live.frames_decoded.saturating_add(1);
                     if let Some(ui) = ui {
-                        let _ = ui.frames.try_send(VideoFrame {
+                        ui.frames.publish(VideoFrame {
                             display_id,
                             width: frame.width,
                             height: frame.height,
