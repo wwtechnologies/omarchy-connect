@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
@@ -93,7 +93,12 @@ fn spawn_session(config: SessionConfig) -> ClientApp {
         shift: false,
         ctrl: false,
         alt: false,
-        frame_count: 0,
+        fps: 0,
+        fps_frames: 0,
+        fps_at: Instant::now(),
+        detached: HashSet::new(),
+        fullscreen: HashSet::new(),
+        chrome: Vec::new(),
         leave: false,
         refused: None,
     }
@@ -297,7 +302,12 @@ struct ClientApp {
     shift: bool,
     ctrl: bool,
     alt: bool,
-    frame_count: u32,
+    fps: u32,
+    fps_frames: u32,
+    fps_at: Instant,
+    detached: HashSet<u32>,
+    fullscreen: HashSet<u32>,
+    chrome: Vec<Rect>,
     leave: bool,
     /// Set when the session ends before any display arrived, e.g. a wrong PIN.
     refused: Option<String>,
@@ -335,7 +345,7 @@ impl eframe::App for ClientApp {
                             self.leave = true;
                         }
                         ui.label(
-                            egui::RichText::new(format!("{} frames", self.frame_count))
+                            egui::RichText::new(format!("{} fps", self.fps))
                                 .size(12.0)
                                 .color(Theme::MUTED),
                         );
@@ -378,8 +388,9 @@ impl eframe::App for ClientApp {
             self.paint_displays(ui);
         });
         if let Some(path_id) = path_id {
-            self.apply_input(ctx, path_id);
+            self.apply_input(ctx, Some(path_id));
         }
+        self.show_detached(ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
@@ -387,7 +398,13 @@ impl eframe::App for ClientApp {
 impl ClientApp {
     fn drain(&mut self, ctx: &egui::Context) {
         while let Ok(frame) = self.frames.try_recv() {
-            self.frame_count = self.frame_count.saturating_add(1);
+            self.fps_frames = self.fps_frames.saturating_add(1);
+            let elapsed = self.fps_at.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                self.fps = (self.fps_frames as f32 / elapsed.as_secs_f32()).round() as u32;
+                self.fps_frames = 0;
+                self.fps_at = Instant::now();
+            }
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
                 &frame.rgba,
@@ -430,25 +447,33 @@ impl ClientApp {
     }
 
     fn paint_displays(&mut self, ui: &mut egui::Ui) {
-        if self.displays.is_empty() {
+        let visible: Vec<_> = self
+            .displays
+            .iter()
+            .filter(|d| !self.detached.contains(&d.id))
+            .cloned()
+            .collect();
+        if visible.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label("Waiting for the host to describe its displays.");
+                ui.label(if self.displays.is_empty() {
+                    "Waiting for the host to describe its displays."
+                } else {
+                    "Each monitor is in its own window."
+                });
             });
             self.hits.clear();
             self.hovered = None;
             return;
         }
         let canvas = ui.available_rect_before_wrap();
-        let min_x = self.displays.iter().map(|d| d.x).min().unwrap_or(0);
-        let min_y = self.displays.iter().map(|d| d.y).min().unwrap_or(0);
-        let max_x = self
-            .displays
+        let min_x = visible.iter().map(|d| d.x).min().unwrap_or(0);
+        let min_y = visible.iter().map(|d| d.y).min().unwrap_or(0);
+        let max_x = visible
             .iter()
             .map(|d| d.x.saturating_add(d.width as i32))
             .max()
             .unwrap_or(1);
-        let max_y = self
-            .displays
+        let max_y = visible
             .iter()
             .map(|d| d.y.saturating_add(d.height as i32))
             .max()
@@ -464,8 +489,11 @@ impl ClientApp {
                 (canvas.height() - desk_h * scale) * 0.5,
             );
         self.hits.clear();
+        self.chrome.clear();
         self.hovered = None;
-        for display in &self.displays {
+        let mut separate = Vec::new();
+        let mut go_fullscreen = Vec::new();
+        for display in &visible {
             let x = origin.x + (display.x - min_x) as f32 * scale;
             let y = origin.y + (display.y - min_y) as f32 * scale;
             let rect = Rect::from_min_size(
@@ -519,11 +547,205 @@ impl ClientApp {
                 Theme::FG,
             );
             self.hits.push((display.clone(), rect));
+            let (sep, full) = self.monitor_buttons(ui, rect);
+            if sep {
+                separate.push(display.id);
+            }
+            if full {
+                go_fullscreen.push(display.id);
+            }
+        }
+        for id in separate {
+            self.detached.insert(id);
+        }
+        for id in go_fullscreen {
+            self.detached.insert(id);
+            self.fullscreen.insert(id);
         }
     }
 
-    fn apply_input(&mut self, ctx: &egui::Context, path_id: egui::Id) {
-        let typing = ctx.memory(|mem| mem.has_focus(path_id));
+    /// Returns `(separate clicked, fullscreen clicked)`.
+    fn monitor_buttons(&mut self, ui: &mut egui::Ui, rect: Rect) -> (bool, bool) {
+        let full = Rect::from_min_size(
+            rect.right_top() + Vec2::new(-118.0, 8.0),
+            Vec2::new(108.0, 24.0),
+        );
+        let separate = Rect::from_min_size(
+            full.left_top() + Vec2::new(-96.0, 0.0),
+            Vec2::new(88.0, 24.0),
+        );
+        self.chrome.push(separate);
+        self.chrome.push(full);
+        let separate_clicked = ui
+            .put(
+                separate,
+                egui::Button::new("Separate").corner_radius(CornerRadius::same(6)),
+            )
+            .clicked();
+        let full_clicked = ui
+            .put(
+                full,
+                egui::Button::new("Full screen").corner_radius(CornerRadius::same(6)),
+            )
+            .clicked();
+        (separate_clicked, full_clicked)
+    }
+
+    fn show_detached(&mut self, ctx: &egui::Context) {
+        let shown: Vec<_> = self
+            .displays
+            .iter()
+            .filter(|d| self.detached.contains(&d.id))
+            .cloned()
+            .collect();
+        let mut dock = Vec::new();
+        let mut windowed = Vec::new();
+        let mut enter_full = Vec::new();
+        for display in shown {
+            let id = display.id;
+            let fullscreen = self.fullscreen.contains(&id);
+            let mut dock_this = false;
+            let mut window_this = false;
+            let mut full_this = false;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("omarchy-display", id)),
+                egui::ViewportBuilder::default()
+                    .with_title(format!("{} — Omarchy", display.name))
+                    .with_inner_size([
+                        display.width as f32 / (display.scale_percent.max(1) as f32 / 100.0),
+                        display.height as f32 / (display.scale_percent.max(1) as f32 / 100.0),
+                    ])
+                    .with_fullscreen(fullscreen),
+                |vctx, _class| {
+                    if vctx.input(|i| i.viewport().close_requested()) {
+                        dock_this = true;
+                    }
+                    egui::TopBottomPanel::top(format!("display-bar-{id}"))
+                        .frame(bar_frame())
+                        .show(vctx, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&display.name)
+                                        .strong()
+                                        .color(Theme::FG),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}×{}",
+                                        display.width, display.height
+                                    ))
+                                    .size(12.0)
+                                    .color(Theme::MUTED),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new("Dock")
+                                                    .corner_radius(CornerRadius::same(8)),
+                                            )
+                                            .clicked()
+                                        {
+                                            dock_this = true;
+                                        }
+                                        let full_label = if fullscreen {
+                                            "Exit full screen"
+                                        } else {
+                                            "Full screen"
+                                        };
+                                        if ui
+                                            .add(
+                                                egui::Button::new(full_label)
+                                                    .corner_radius(CornerRadius::same(8)),
+                                            )
+                                            .clicked()
+                                        {
+                                            if fullscreen {
+                                                window_this = true;
+                                            } else {
+                                                full_this = true;
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    self.hits.clear();
+                    self.chrome.clear();
+                    self.hovered = None;
+                    egui::CentralPanel::default().show(vctx, |ui| {
+                        let canvas = ui.available_rect_before_wrap();
+                        self.paint_monitor(ui, &display, canvas);
+                    });
+                    self.apply_input(vctx, None);
+                    vctx.request_repaint_after(Duration::from_millis(16));
+                },
+            );
+            if dock_this {
+                dock.push(id);
+            }
+            if window_this {
+                windowed.push(id);
+            }
+            if full_this {
+                enter_full.push(id);
+            }
+        }
+        for id in dock {
+            self.detached.remove(&id);
+            self.fullscreen.remove(&id);
+        }
+        for id in windowed {
+            self.fullscreen.remove(&id);
+        }
+        for id in enter_full {
+            self.fullscreen.insert(id);
+        }
+    }
+
+    fn paint_monitor(
+        &mut self,
+        ui: &mut egui::Ui,
+        display: &omarchy_protocol::DisplayInfo,
+        canvas: Rect,
+    ) {
+        let scale = (canvas.width() / display.width.max(1) as f32)
+            .min(canvas.height() / display.height.max(1) as f32)
+            .max(0.01);
+        let size = Vec2::new(display.width as f32 * scale, display.height as f32 * scale);
+        let rect = Rect::from_center_size(canvas.center(), size);
+        let response = ui.interact(
+            rect,
+            ui.id().with(("monitor", display.id)),
+            Sense::click_and_drag(),
+        );
+        if response.hovered() {
+            self.hovered = Some(display.id);
+            response.on_hover_cursor(egui::CursorIcon::Crosshair);
+        }
+        if let Some(texture) = self.textures.get(&display.id) {
+            ui.painter().image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(8), Theme::BG_DARK);
+        }
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(8),
+            Stroke::new(1.5_f32, Theme::ACCENT),
+            StrokeKind::Inside,
+        );
+        self.hits.push((display.clone(), rect));
+    }
+
+    fn apply_input(&mut self, ctx: &egui::Context, path_id: Option<egui::Id>) {
+        let typing = path_id.is_some_and(|id| ctx.memory(|mem| mem.has_focus(id)));
         let pointer = ctx.input(|input| input.pointer.hover_pos());
         if !typing {
             if let Some(pos) = pointer {
@@ -537,6 +759,9 @@ impl ClientApp {
                             y,
                         }));
                 }
+            }
+            if !ctx.input(|input| input.focused) {
+                return;
             }
             let mods = ctx.input(|input| input.modifiers);
             self.sync_mod(keys::KEY_LEFTSHIFT, self.shift, mods.shift);
@@ -557,6 +782,22 @@ impl ClientApp {
                         if repeat {
                             continue;
                         }
+                        if pressed && key == egui::Key::F11 {
+                            if let Some(id) = self.hovered {
+                                self.detached.insert(id);
+                                if !self.fullscreen.insert(id) {
+                                    self.fullscreen.remove(&id);
+                                }
+                            }
+                            continue;
+                        }
+                        if pressed && key == egui::Key::Escape {
+                            if let Some(id) = self.hovered {
+                                if self.fullscreen.remove(&id) {
+                                    continue;
+                                }
+                            }
+                        }
                         if let Some(code) = evdev_code(key) {
                             let _ = self
                                 .commands
@@ -571,7 +812,9 @@ impl ClientApp {
                     } => {
                         if let Some((display, rect)) = self.hit(pos) {
                             if pressed {
-                                ctx.memory_mut(|mem| mem.surrender_focus(path_id));
+                                if let Some(path_id) = path_id {
+                                    ctx.memory_mut(|mem| mem.surrender_focus(path_id));
+                                }
                             }
                             let (x, y) = pixel(&display, rect, pos);
                             let button = match button {
@@ -634,6 +877,9 @@ impl ClientApp {
     }
 
     fn hit(&self, pos: Pos2) -> Option<(omarchy_protocol::DisplayInfo, Rect)> {
+        if self.chrome.iter().any(|rect| rect.contains(pos)) {
+            return None;
+        }
         self.hits
             .iter()
             .find(|(_, rect)| rect.contains(pos))

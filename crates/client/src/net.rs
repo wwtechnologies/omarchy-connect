@@ -238,6 +238,29 @@ async fn session(
 
     let mut decoders = DecoderBank::new();
     let mut closed = String::from("connection closed");
+    // read_message is not cancellation-safe. A mouse event in select! would
+    // drop bytes already taken from the TLS stream and the next length would
+    // be garbage ("frame length ... is outside 1..=8388608").
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(8);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match read_message(&mut reader).await {
+                Ok(msg) => {
+                    if incoming_tx.send(Ok(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(ProtocolError::Closed) => {
+                    let _ = incoming_tx.send(Err(ProtocolError::Closed)).await;
+                    break;
+                }
+                Err(err) => {
+                    let _ = incoming_tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+    });
     loop {
         tokio::select! {
             biased;
@@ -265,11 +288,11 @@ async fn session(
                     }
                 }
             }
-            incoming = read_message(&mut reader) => {
+            incoming = incoming_rx.recv() => {
                 let msg = match incoming {
-                    Ok(msg) => msg,
-                    Err(ProtocolError::Closed) => break,
-                    Err(err) => {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(ProtocolError::Closed)) | None => break,
+                    Some(Err(err)) => {
                         closed = err.to_string();
                         break;
                     }
@@ -287,6 +310,7 @@ async fn session(
     }
 
     drop(ctrl_tx);
+    reader_task.abort();
     writer_task.abort();
     emit(ui, UiEvent::Closed(closed.clone()));
     let report = live.report();
