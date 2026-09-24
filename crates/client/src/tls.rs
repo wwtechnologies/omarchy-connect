@@ -4,34 +4,25 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error, SignatureScheme};
-use sha2::{Digest, Sha256};
 
+/// Accepts the host's ephemeral certificate without pinning it. The host is
+/// authenticated by the PIN exchange, which is bound to this TLS session's
+/// exporter, so a substituted certificate fails the PIN confirmation.
+/// Handshake signatures are still checked so the exporter belongs to the
+/// holder of the certificate's key.
 #[derive(Debug)]
-pub struct PinVerifier {
-    pin: [u8; 32],
-}
+struct PinBoundVerifier;
 
-impl PinVerifier {
-    pub fn new(pin: [u8; 32]) -> Self {
-        Self { pin }
-    }
-}
-
-impl ServerCertVerifier for PinVerifier {
+impl ServerCertVerifier for PinBoundVerifier {
     fn verify_server_cert(
         &self,
-        end_entity: &CertificateDer<'_>,
+        _end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        let digest = Sha256::digest(end_entity.as_ref());
-        if digest.as_slice() == self.pin {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(Error::General("certificate pin mismatch".into()))
-        }
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -67,13 +58,12 @@ pub fn install_ring() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-pub fn client_config(pin: [u8; 32]) -> Arc<rustls::ClientConfig> {
+pub fn client_config() -> Arc<rustls::ClientConfig> {
     install_ring();
-    let verifier = Arc::new(PinVerifier::new(pin));
     Arc::new(
         rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(verifier)
+            .with_custom_certificate_verifier(Arc::new(PinBoundVerifier))
             .with_no_client_auth(),
     )
 }

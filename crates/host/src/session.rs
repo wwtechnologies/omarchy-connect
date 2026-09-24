@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use omarchy_protocol::auth::{PinExchange, Side, TLS_EXPORTER_LABEL};
 use omarchy_protocol::{
     read_message, write_message, DisplayInfo, FileReceiver, FileSender, FileTransferError,
     InputEvent, Message, ProtocolError, VERSION,
 };
-use tokio::io::{split, AsyncWriteExt};
+use tokio::io::{split, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -19,7 +20,15 @@ use tokio_util::sync::CancellationToken;
 use crate::capture::{self, RawFrame, SyntheticDesktop};
 use crate::encode::Encoder;
 use crate::input::{Cursor, Injector};
-use crate::tls::{self, Identity};
+use crate::lockout::Lockout;
+use crate::settings::Settings;
+use crate::state::{unix_now, LiveState, Publisher, Status};
+use crate::tls;
+
+/// TLS, hello, and PIN exchange together. A client that stalls here would
+/// otherwise hold the single session slot.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+const WRONG_PIN_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct HostConfig {
@@ -29,14 +38,22 @@ pub struct HostConfig {
     pub bitrate_kbps: u32,
     pub download_dir: PathBuf,
     pub offer_file: Option<PathBuf>,
-    pub pin_file: Option<PathBuf>,
+    /// Fixed PIN for this run. Overrides `settings_path`.
+    pub pin: Option<String>,
+    /// Unattended PIN and switch, reread for every connection.
+    pub settings_path: Option<PathBuf>,
+    /// Live status JSON for the bar.
+    pub state_path: Option<PathBuf>,
+    /// Portal restore token, so the share picker only appears once.
+    pub restore_token: Option<PathBuf>,
     pub input: InputMode,
+    /// Desktop notification when a session starts.
+    pub notify: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputMode {
     Auto,
-    Portal,
     Uinput,
     None,
 }
@@ -45,18 +62,18 @@ impl InputMode {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         match text {
             "auto" => Ok(Self::Auto),
-            "portal" => Ok(Self::Portal),
             "uinput" => Ok(Self::Uinput),
             "none" => Ok(Self::None),
-            other => anyhow::bail!("unknown input mode {other} (auto, portal, uinput, none)"),
+            other => anyhow::bail!("unknown input mode {other} (auto, uinput, none)"),
         }
     }
 }
 
 pub struct HostReady {
     pub addr: SocketAddr,
-    pub pin: String,
 }
+
+type CurrentSession = Arc<Mutex<Option<CancellationToken>>>;
 
 pub async fn run_host(
     config: HostConfig,
@@ -66,32 +83,46 @@ pub async fn run_host(
     if config.fps == 0 {
         anyhow::bail!("fps must be at least 1");
     }
+    if let Some(pin) = &config.pin {
+        omarchy_protocol::auth::validate_pin(pin).map_err(anyhow::Error::msg)?;
+    }
     std::fs::create_dir_all(&config.download_dir)
         .with_context(|| format!("create {}", config.download_dir.display()))?;
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("bind {}", config.bind))?;
     let addr = listener.local_addr().context("local address")?;
-    let identity = tls::generate_identity()?;
-    if let Some(path) = &config.pin_file {
-        std::fs::write(path, format!("{}\n", identity.pin_hex))
-            .with_context(|| format!("write pin file {}", path.display()))?;
-    }
+    let acceptor = TlsAcceptor::from(tls::generate_config()?);
+    let publisher = Publisher::new(
+        config.state_path.clone(),
+        LiveState {
+            pid: std::process::id(),
+            port: addr.port(),
+            input_ready: !config.demo && uinput_writable(),
+            ..LiveState::default()
+        },
+    );
     println!("omarchy-connect host");
     println!("listen {addr}");
-    println!("pin {}", identity.pin_hex);
+    if config.pin.is_some() {
+        println!("auth fixed PIN from --pin");
+    } else if let Some(path) = &config.settings_path {
+        println!("auth unattended PIN from {}", path.display());
+    } else {
+        println!("auth none configured; every client will be refused");
+    }
     if config.demo {
         println!("capture demo (synthetic displays)");
     } else {
         println!("capture xdg-desktop-portal / pipewire");
     }
     if let Some(tx) = ready {
-        let _ = tx.send(HostReady {
-            addr,
-            pin: identity.pin_hex.clone(),
-        });
+        let _ = tx.send(HostReady { addr });
     }
-    let acceptor = TlsAcceptor::from(identity.config.clone());
+
+    let current: CurrentSession = Arc::new(Mutex::new(None));
+    spawn_disconnect_signal(current.clone());
+    let mut lockout = Lockout::default();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -99,42 +130,121 @@ pub async fn run_host(
                 let (tcp, peer) = incoming.context("accept")?;
                 tracing::info!(%peer, "client connected");
                 tcp.set_nodelay(true).ok();
-                if let Err(err) = handle_client(tcp, &acceptor, &identity, &config, &cancel).await {
+                let session_cancel = cancel.child_token();
+                *current.lock().expect("current session") = Some(session_cancel.clone());
+                let result = handle_client(tcp, peer, &acceptor, &config, &mut lockout, &publisher, &session_cancel).await;
+                *current.lock().expect("current session") = None;
+                if let Err(err) = &result {
                     tracing::warn!(error = %err, "session ended");
                 }
+                publisher.update(|s| {
+                    s.status = Status::Listening;
+                    s.peer = None;
+                    s.client = None;
+                    s.since = None;
+                    s.last_error = result.err().map(|err| format!("{err:#}"));
+                });
             }
         }
     }
+    publisher.clear();
     Ok(())
+}
+
+/// `omarchy-connect disconnect` sends SIGUSR1; it ends the current session
+/// and leaves the listener up.
+fn spawn_disconnect_signal(current: CurrentSession) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
+            return;
+        };
+        while usr1.recv().await.is_some() {
+            if let Some(token) = current.lock().expect("current session").as_ref() {
+                tracing::info!("disconnect requested");
+                token.cancel();
+            }
+        }
+    });
+    #[cfg(not(unix))]
+    let _ = current;
+}
+
+fn uinput_writable() -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/uinput")
+        .is_ok()
 }
 
 async fn handle_client(
     tcp: TcpStream,
+    peer: SocketAddr,
     acceptor: &TlsAcceptor,
-    identity: &Identity,
     config: &HostConfig,
-    cancel: &CancellationToken,
+    lockout: &mut Lockout,
+    publisher: &Publisher,
+    session_cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let _ = identity;
-    let mut tls = acceptor.accept(tcp).await.context("tls handshake")?;
-    let hello = read_message(&mut tls).await.context("read hello")?;
-    match hello {
-        Message::Hello { version, name } if version == VERSION => {
-            tracing::info!(%name, "client hello");
+    let handshake = async {
+        let mut tls = acceptor.accept(tcp).await.context("tls handshake")?;
+        let name = match read_message(&mut tls).await.context("read hello")? {
+            Message::Hello { version, name } if version == VERSION => name,
+            Message::Hello { version, .. } => {
+                let _ = deny(
+                    &mut tls,
+                    0,
+                    &format!("This host speaks protocol {VERSION}. Update the client."),
+                )
+                .await;
+                anyhow::bail!("client protocol version {version}, host is {VERSION}");
+            }
+            _ => anyhow::bail!("expected hello"),
+        };
+        write_message(&mut tls, &Message::HelloAck { version: VERSION })
+            .await
+            .context("write hello ack")?;
+        let binding: [u8; 32] = tls
+            .get_ref()
+            .1
+            .export_keying_material([0u8; 32], TLS_EXPORTER_LABEL, None)
+            .context("tls exporter")?;
+        let pin = config.pin.clone().or_else(|| {
+            let path = config.settings_path.as_ref()?;
+            match Settings::load(path) {
+                Ok(settings) => settings.active_pin().map(str::to_string),
+                Err(err) => {
+                    tracing::warn!(error = %err, "settings");
+                    None
+                }
+            }
+        });
+        authenticate(&mut tls, &binding, pin.as_deref(), lockout, publisher).await?;
+        anyhow::Ok((tls, name))
+    };
+    let (tls, name) = tokio::select! {
+        _ = session_cancel.cancelled() => return Ok(()),
+        outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake) => {
+            outcome.map_err(|_| anyhow::anyhow!("handshake timed out"))??
         }
-        Message::Hello { version, .. } => {
-            anyhow::bail!("client protocol version {version}, host is {VERSION}");
-        }
-        _ => anyhow::bail!("expected hello"),
+    };
+    tracing::info!(%peer, client = %name, "client authenticated");
+    publisher.update(|s| {
+        s.status = if config.demo { Status::Connected } else { Status::Sharing };
+        s.peer = Some(peer.ip().to_string());
+        s.client = Some(name.clone());
+        s.since = Some(unix_now());
+        s.last_error = None;
+    });
+    if config.notify {
+        notify(&format!("Remote session from {} ({name})", peer.ip()));
     }
-    write_message(&mut tls, &Message::HelloAck { version: VERSION })
-        .await
-        .context("write hello ack")?;
 
     let (reader, mut writer) = split(tls);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Message>(32);
     let (video_tx, mut video_rx) = mpsc::channel::<Message>(2);
-    let session_cancel = cancel.child_token();
+    let session_cancel = session_cancel.clone();
 
     let writer_cancel = session_cancel.clone();
     let writer_task = tokio::spawn(async move {
@@ -170,25 +280,22 @@ async fn handle_client(
 
     if config.demo {
         displays = capture::demo_displays();
-        injector = build_injector(config.input, true, &displays, None);
+        injector = build_injector(config.input, true, &displays);
     } else {
         #[cfg(target_os = "linux")]
         {
             let mut portal = tokio::select! {
-                _ = session_cancel.cancelled() => return Ok(()),
-                opened = capture::open_portal() => opened.context(
-                    "xdg-desktop-portal capture failed. On Omarchy this needs a Hyprland session and xdg-desktop-portal-hyprland. Use --demo without a portal."
+                _ = session_cancel.cancelled() => {
+                    writer_task.abort();
+                    return Ok(());
+                }
+                opened = capture::open_portal(config.restore_token.as_deref()) => opened.context(
+                    "screen share failed. On Omarchy this needs Hyprland and xdg-desktop-portal-hyprland. Use --demo without a portal."
                 )?,
             };
             displays = portal.displays.clone();
             portal_frames = Some(portal.take_frames());
-            let portal_input =
-                if config.input == InputMode::Portal || config.input == InputMode::Auto {
-                    portal.take_input()
-                } else {
-                    None
-                };
-            injector = build_injector(config.input, false, &displays, portal_input);
+            injector = build_injector(config.input, false, &displays);
             portal_guard = Some(portal);
         }
         #[cfg(not(target_os = "linux"))]
@@ -196,6 +303,7 @@ async fn handle_client(
             anyhow::bail!("portal capture requires linux. Use --demo.");
         }
     }
+    publisher.update(|s| s.status = Status::Connected);
 
     let result = drive_session(
         config,
@@ -214,6 +322,101 @@ async fn handle_client(
     #[cfg(target_os = "linux")]
     drop(portal_guard);
     result
+}
+
+async fn authenticate<S>(
+    tls: &mut S,
+    binding: &[u8],
+    pin: Option<&str>,
+    lockout: &mut Lockout,
+    publisher: &Publisher,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Message::Auth { spake2: client_msg } = read_message(tls).await.context("read auth")?
+    else {
+        anyhow::bail!("expected auth");
+    };
+    if let Some(left) = lockout.remaining(Instant::now()) {
+        let secs = left.as_secs().max(1) as u32;
+        let _ = deny(
+            tls,
+            secs,
+            &format!("Too many wrong PINs. Try again in {secs} s."),
+        )
+        .await;
+        anyhow::bail!("locked out for {secs} s");
+    }
+    let Some(pin) = pin else {
+        let _ = deny(
+            tls,
+            0,
+            "Unattended access is off on this host. Turn it on and set a PIN from Omarchy Connect in the top bar.",
+        )
+        .await;
+        anyhow::bail!("refused: no unattended PIN set");
+    };
+    let (exchange, host_msg) = PinExchange::start(Side::Host, pin);
+    write_message(tls, &Message::Auth { spake2: host_msg })
+        .await
+        .context("write auth")?;
+    let keys = exchange.finish(&client_msg, binding);
+    let Message::AuthConfirm { mac } = read_message(tls).await.context("read auth confirm")? else {
+        anyhow::bail!("expected auth confirm");
+    };
+    let verified = keys.as_ref().map(|keys| keys.verify_peer(&mac));
+    let Ok(Ok(())) = verified else {
+        let lock = lockout.fail(Instant::now());
+        if let Some(lock) = lock {
+            publisher.update(|s| s.locked_until = Some(unix_now() + lock.as_secs()));
+        }
+        tokio::time::sleep(WRONG_PIN_DELAY).await;
+        let retry = lock.map(|lock| lock.as_secs() as u32).unwrap_or(0);
+        let _ = deny(tls, retry, "Wrong PIN.").await;
+        anyhow::bail!("wrong PIN");
+    };
+    lockout.succeed();
+    publisher.update(|s| s.locked_until = None);
+    let keys = keys.expect("verified keys");
+    write_message(
+        tls,
+        &Message::AuthConfirm {
+            mac: keys.confirmation(),
+        },
+    )
+    .await
+    .context("write auth confirm")?;
+    Ok(())
+}
+
+async fn deny<S>(tls: &mut S, retry_after_secs: u32, reason: &str) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_message(
+        tls,
+        &Message::AuthDenied {
+            retry_after_secs,
+            reason: reason.into(),
+        },
+    )
+    .await?;
+    tls.shutdown().await?;
+    Ok(())
+}
+
+fn notify(body: &str) {
+    let spawned = std::process::Command::new("notify-send")
+        .args(["--app-name=Omarchy Connect", "Omarchy Connect", body])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Ok(mut child) = spawned {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,31 +582,14 @@ async fn send_frame(
     Ok(())
 }
 
-fn build_injector(
-    mode: InputMode,
-    demo: bool,
-    displays: &[DisplayInfo],
-    #[cfg(target_os = "linux")] portal: Option<crate::capture::PortalInput>,
-    #[cfg(not(target_os = "linux"))] portal: Option<()>,
-) -> Injector {
+fn build_injector(mode: InputMode, demo: bool, displays: &[DisplayInfo]) -> Injector {
     match mode {
         InputMode::None => Injector::None,
-        InputMode::Portal if demo => {
+        InputMode::Auto if demo => {
             tracing::info!("demo mode draws the pointer into the test pattern");
             Injector::None
         }
-        InputMode::Auto if demo => Injector::None,
-        InputMode::Portal | InputMode::Auto => {
-            #[cfg(target_os = "linux")]
-            {
-                if let Some(portal) = portal {
-                    return Injector::Portal(portal);
-                }
-            }
-            let _ = portal;
-            open_uinput_or_none(displays)
-        }
-        InputMode::Uinput => open_uinput_or_none(displays),
+        InputMode::Auto | InputMode::Uinput => open_uinput_or_none(displays),
     }
 }
 

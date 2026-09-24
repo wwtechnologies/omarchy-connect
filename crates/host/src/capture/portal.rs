@@ -1,20 +1,25 @@
-//! xdg-desktop-portal ScreenCast + RemoteDesktop, then PipeWire.
+//! xdg-desktop-portal ScreenCast, then PipeWire.
 //!
-//! Hyprland has no X11 root window. The portal (xdg-desktop-portal-hyprland)
-//! is the capture and input path: RemoteDesktop creates the session, ScreenCast
-//! selects monitors, and PipeWire delivers raw frames. Pointer and key events
-//! go back through RemoteDesktop so the compositor injects them.
+//! Hyprland has no X11 root window, so capture goes through
+//! xdg-desktop-portal-hyprland. That backend implements ScreenCast but not
+//! RemoteDesktop, so input is injected separately (uinput). ScreenCast selects
+//! monitors and PipeWire delivers raw frames.
+//!
+//! The session is started with `PersistMode::ExplicitlyRevoked`. The portal
+//! returns a restore token, which is saved and offered on the next session so
+//! the share picker is skipped. xdph only issues one when the picker's
+//! "allow restore token" box is checked or `screencopy:allow_token_by_default`
+//! is set.
 
-use std::collections::HashMap;
 use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
-use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType, Stream as PortalStream};
 use ashpd::desktop::PersistMode;
-use omarchy_protocol::{keys, DisplayInfo, InputEvent};
+use omarchy_protocol::DisplayInfo;
 use pipewire as pw;
 use pw::spa;
 
@@ -24,17 +29,19 @@ use crate::yuv::{self, PixelOrder};
 pub struct PortalCapture {
     pub displays: Vec<DisplayInfo>,
     frames: Option<tokio::sync::mpsc::Receiver<RawFrame>>,
-    input: Option<PortalInput>,
     stop: Arc<AtomicBool>,
-}
-
-pub struct PortalInput {
-    tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    session: Option<ashpd::desktop::Session<'static, Screencast<'static>>>,
+    _screencast: Screencast<'static>,
 }
 
 impl Drop for PortalCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(session) = self.session.take() {
+            tokio::spawn(async move {
+                let _ = session.close().await;
+            });
+        }
     }
 }
 
@@ -42,62 +49,59 @@ impl PortalCapture {
     pub fn take_frames(&mut self) -> tokio::sync::mpsc::Receiver<RawFrame> {
         self.frames.take().expect("portal frames taken once")
     }
+}
 
-    pub fn take_input(&mut self) -> Option<PortalInput> {
-        self.input.take()
+pub async fn open_portal(restore_token: Option<&Path>) -> anyhow::Result<PortalCapture> {
+    let saved = restore_token.and_then(read_token);
+    match start_screencast(saved.as_deref(), restore_token).await {
+        Ok(capture) => Ok(capture),
+        Err(err) if saved.is_some() => {
+            tracing::warn!(error = %err, "restore token rejected, asking again");
+            if let Some(path) = restore_token {
+                let _ = std::fs::remove_file(path);
+            }
+            start_screencast(None, restore_token).await
+        }
+        Err(err) => Err(err),
     }
 }
 
-impl PortalInput {
-    pub async fn apply(&self, event: InputEvent) {
-        let _ = self.tx.send(event);
-    }
-}
-
-pub async fn open_portal() -> anyhow::Result<PortalCapture> {
-    let remote = RemoteDesktop::new()
-        .await
-        .context("connect to org.freedesktop.portal.RemoteDesktop")?;
+async fn start_screencast(
+    token: Option<&str>,
+    token_path: Option<&Path>,
+) -> anyhow::Result<PortalCapture> {
     let screencast = Screencast::new()
         .await
         .context("connect to org.freedesktop.portal.ScreenCast")?;
-    let session = remote
+    let session = screencast
         .create_session()
         .await
-        .context("create remote-desktop session")?;
-    remote
-        .select_devices(
-            &session,
-            DeviceType::Keyboard | DeviceType::Pointer,
-            None,
-            PersistMode::DoNot,
-        )
-        .await
-        .context("select keyboard and pointer")?
-        .response()
-        .context("remote-desktop device response")?;
+        .context("create screencast session")?;
     screencast
         .select_sources(
             &session,
             CursorMode::Embedded,
-            SourceType::Monitor | SourceType::Window,
+            SourceType::Monitor.into(),
             true,
-            None,
-            PersistMode::DoNot,
+            token,
+            PersistMode::ExplicitlyRevoked,
         )
         .await
         .context("select screencast sources")?
         .response()
         .context("screencast source response")?;
-    let started = remote
+    if token.is_none() {
+        tracing::info!("waiting for the share picker on the Omarchy screen");
+    }
+    let started = screencast
         .start(&session, None)
         .await
-        .context("start remote-desktop session. A portal dialog should be visible; select the monitors to share")?;
-    let selected = started.response().context("portal start was cancelled")?;
-    let streams = selected
-        .streams()
-        .context("portal started without screencast streams")?
-        .to_vec();
+        .context("start screencast. Select the monitors to share in the picker")?;
+    let selected = started.response().context("screen share was cancelled")?;
+    if let (Some(path), Some(new_token)) = (token_path, selected.restore_token()) {
+        save_token(path, new_token);
+    }
+    let streams = selected.streams().to_vec();
     if streams.is_empty() {
         anyhow::bail!("portal returned no streams");
     }
@@ -107,9 +111,7 @@ pub async fn open_portal() -> anyhow::Result<PortalCapture> {
         .context("open pipewire remote")?;
 
     let (displays, targets) = displays_from_streams(&streams);
-    let nodes: HashMap<u32, u32> = targets.iter().map(|t| (t.display_id, t.node_id)).collect();
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(2);
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
 
@@ -122,22 +124,33 @@ pub async fn open_portal() -> anyhow::Result<PortalCapture> {
         })
         .context("spawn pipewire thread")?;
 
-    tokio::spawn(async move {
-        let _keep_screencast = screencast;
-        while let Some(event) = input_rx.recv().await {
-            if let Err(err) = apply_portal_input(&remote, &session, &nodes, &event).await {
-                tracing::warn!(error = %err, "portal input");
-            }
-        }
-    });
-
     tracing::info!(count = displays.len(), "portal capture started");
     Ok(PortalCapture {
         displays,
         frames: Some(frame_rx),
-        input: Some(PortalInput { tx: input_tx }),
         stop,
+        session: Some(session),
+        _screencast: screencast,
     })
+}
+
+fn read_token(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn save_token(path: &Path, token: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = std::fs::write(path, token) {
+        tracing::warn!(error = %err, path = %path.display(), "save restore token");
+    }
+}
+
+pub fn default_token_path() -> Option<PathBuf> {
+    crate::paths::state_dir().map(|dir| dir.join("screencast-restore-token"))
 }
 
 struct StreamTarget {
@@ -177,60 +190,6 @@ fn displays_from_streams(streams: &[PortalStream]) -> (Vec<DisplayInfo>, Vec<Str
     (displays, targets)
 }
 
-async fn apply_portal_input(
-    remote: &RemoteDesktop<'_>,
-    session: &ashpd::desktop::Session<'_, RemoteDesktop<'_>>,
-    nodes: &HashMap<u32, u32>,
-    event: &InputEvent,
-) -> anyhow::Result<()> {
-    match event {
-        InputEvent::MouseMove { display_id, x, y } => {
-            let node = nodes.get(display_id).copied().unwrap_or(0);
-            remote
-                .notify_pointer_motion_absolute(session, node, f64::from(*x), f64::from(*y))
-                .await?;
-        }
-        InputEvent::MouseButton {
-            button, pressed, ..
-        } => {
-            let Some(code) = keys::pointer_button(*button) else {
-                return Ok(());
-            };
-            let state = if *pressed {
-                KeyState::Pressed
-            } else {
-                KeyState::Released
-            };
-            remote
-                .notify_pointer_button(session, i32::from(code), state)
-                .await?;
-        }
-        InputEvent::MouseWheel { dx, dy, .. } => {
-            if *dy != 0 {
-                remote
-                    .notify_pointer_axis_discrete(session, Axis::Vertical, *dy)
-                    .await?;
-            }
-            if *dx != 0 {
-                remote
-                    .notify_pointer_axis_discrete(session, Axis::Horizontal, *dx)
-                    .await?;
-            }
-        }
-        InputEvent::Key { code, pressed } => {
-            let state = if *pressed {
-                KeyState::Pressed
-            } else {
-                KeyState::Released
-            };
-            remote
-                .notify_keyboard_keycode(session, i32::from(*code), state)
-                .await?;
-        }
-    }
-    Ok(())
-}
-
 fn pipewire_thread(
     fd: OwnedFd,
     targets: Vec<StreamTarget>,
@@ -238,16 +197,16 @@ fn pipewire_thread(
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     pw::init();
-    let mainloop = pw::main_loop::MainLoop::new(None).context("pipewire main loop")?;
-    let context = pw::context::Context::new(&mainloop).context("pipewire context")?;
+    let mainloop = pw::main_loop::MainLoopRc::new(None).context("pipewire main loop")?;
+    let context = pw::context::ContextRc::new(&mainloop, None).context("pipewire context")?;
     let core = context
-        .connect_fd(fd, None)
+        .connect_fd_rc(fd, None)
         .context("pipewire connect_fd")?;
 
     let mut holders: Vec<StreamHolder> = Vec::new();
     for target in targets {
-        let stream = pw::stream::Stream::new(
-            &core,
+        let stream = pw::stream::StreamRc::new(
+            core.clone(),
             "omarchy-connect",
             pw::properties::properties! {
                 *pw::keys::MEDIA_TYPE => "Video",
@@ -334,7 +293,7 @@ fn pipewire_thread(
     while !stop.load(Ordering::Relaxed) {
         if mainloop
             .loop_()
-            .iterate(std::time::Duration::from_millis(20))
+            .iterate(pw::loop_::Timeout::Finite(std::time::Duration::from_millis(20)))
             < 0
         {
             break;
@@ -352,7 +311,7 @@ struct StreamData {
 }
 
 struct StreamHolder {
-    _stream: pw::stream::Stream,
+    _stream: pw::stream::StreamRc,
     _listener: pw::stream::StreamListener<StreamData>,
     _pod: Vec<u8>,
 }

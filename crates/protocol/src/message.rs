@@ -30,6 +30,12 @@
 //! | 11   | FileCancel    | `u32 id`, `string reason` |
 //! | 12   | Ping          | `u64 nonce` |
 //! | 13   | Pong          | `u64 nonce` |
+//! | 14   | Auth          | `bytes spake2` |
+//! | 15   | AuthConfirm   | 32-byte HMAC-SHA256 |
+//! | 16   | AuthDenied    | `u32 retry_after_secs`, `string reason` |
+//!
+//! Auth messages come right after `HelloAck` and before anything else. See
+//! [`crate::auth`] for the exchange.
 //!
 //! A display is `u32 id`, `i32 x`, `i32 y`, `u32 width`, `u32 height`,
 //! `u16 scale_percent` (100 = 1.0), `string name`. `x` and `y` are the
@@ -61,7 +67,7 @@
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
 const MAX_DISPLAYS: usize = 16;
@@ -79,6 +85,9 @@ const T_FILE_COMPLETE: u8 = 10;
 const T_FILE_CANCEL: u8 = 11;
 const T_PING: u8 = 12;
 const T_PONG: u8 = 13;
+const T_AUTH: u8 = 14;
+const T_AUTH_CONFIRM: u8 = 15;
+const T_AUTH_DENIED: u8 = 16;
 
 const I_MOVE: u8 = 1;
 const I_BUTTON: u8 = 2;
@@ -187,6 +196,16 @@ pub enum Message {
     },
     Pong {
         nonce: u64,
+    },
+    Auth {
+        spake2: Vec<u8>,
+    },
+    AuthConfirm {
+        mac: [u8; 32],
+    },
+    AuthDenied {
+        retry_after_secs: u32,
+        reason: String,
     },
 }
 
@@ -297,6 +316,22 @@ impl Message {
             Message::Pong { nonce } => {
                 out.push(T_PONG);
                 put_u64(out, *nonce);
+            }
+            Message::Auth { spake2 } => {
+                out.push(T_AUTH);
+                put_bytes(out, spake2);
+            }
+            Message::AuthConfirm { mac } => {
+                out.push(T_AUTH_CONFIRM);
+                out.extend_from_slice(mac);
+            }
+            Message::AuthDenied {
+                retry_after_secs,
+                reason,
+            } => {
+                out.push(T_AUTH_DENIED);
+                put_u32(out, *retry_after_secs);
+                put_str(out, reason);
             }
         }
     }
@@ -413,6 +448,18 @@ impl Message {
             },
             T_PING => Message::Ping { nonce: r.u64()? },
             T_PONG => Message::Pong { nonce: r.u64()? },
+            T_AUTH => Message::Auth {
+                spake2: r.bytes()?.to_vec(),
+            },
+            T_AUTH_CONFIRM => {
+                let mut mac = [0u8; 32];
+                mac.copy_from_slice(r.take(32)?);
+                Message::AuthConfirm { mac }
+            }
+            T_AUTH_DENIED => Message::AuthDenied {
+                retry_after_secs: r.u32()?,
+                reason: r.str()?,
+            },
             other => return Err(ProtocolError::UnknownType(other)),
         };
         if !r.is_empty() {
@@ -638,6 +685,14 @@ mod tests {
         });
         roundtrip(Message::Ping { nonce: 42 });
         roundtrip(Message::Pong { nonce: 42 });
+        roundtrip(Message::Auth {
+            spake2: vec![0x41; 33],
+        });
+        roundtrip(Message::AuthConfirm { mac: [0x5a; 32] });
+        roundtrip(Message::AuthDenied {
+            retry_after_secs: 30,
+            reason: "too many attempts".into(),
+        });
     }
 
     #[test]

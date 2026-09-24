@@ -76,7 +76,7 @@ fn spawn_session(config: SessionConfig) -> ClientApp {
             }
         };
         if let Err(err) = runtime.block_on(run_session(config, cmd_rx, Some(sink))) {
-            let _ = event_tx.send(UiEvent::Closed(err.to_string()));
+            let _ = event_tx.send(UiEvent::Closed(format!("{err:#}")));
         }
     });
     ClientApp {
@@ -95,6 +95,7 @@ fn spawn_session(config: SessionConfig) -> ClientApp {
         alt: false,
         frame_count: 0,
         leave: false,
+        refused: None,
     }
 }
 
@@ -116,6 +117,12 @@ impl eframe::App for Shell {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(reason) = self.session.as_mut().and_then(|s| s.refused.take()) {
+            self.form_error = reason;
+            self.session = None;
+            self.focused = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(640.0, 560.0)));
+        }
         if self.session.as_ref().is_some_and(|session| session.leave) {
             if let Some(session) = self.session.take() {
                 let _ = session.commands.send(ClientCommand::Disconnect);
@@ -137,7 +144,7 @@ impl Shell {
             let avail = ui.available_rect_before_wrap();
             let card = Rect::from_center_size(
                 avail.center(),
-                Vec2::new(440.0, 460.0).min(avail.size() - Vec2::splat(32.0)),
+                Vec2::new(440.0, 490.0).min(avail.size() - Vec2::splat(32.0)),
             );
             ui.painter().rect_filled(card, CornerRadius::same(18), Theme::LIFT);
             ui.painter().rect_stroke(
@@ -187,13 +194,20 @@ impl Shell {
                         .color(Theme::MUTED),
                 );
                 ui.add_space(14.0);
-                field_label(ui, "Pin");
+                field_label(ui, "PIN");
                 let pin = ui.add(
                     egui::TextEdit::singleline(&mut self.pin_text)
-                        .hint_text("SHA-256 from the host")
+                        .hint_text("Unattended access PIN")
+                        .password(true)
                         .desired_width(f32::INFINITY)
                         .margin(egui::Margin::symmetric(12, 10))
-                        .font(FontId::monospace(14.0)),
+                        .font(FontId::proportional(16.0)),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Set it from Omarchy Connect in the host's top bar")
+                        .size(12.0)
+                        .color(Theme::MUTED),
                 );
                 ui.add_space(20.0);
                 let button = ui.add_sized(
@@ -285,6 +299,8 @@ struct ClientApp {
     alt: bool,
     frame_count: u32,
     leave: bool,
+    /// Set when the session ends before any display arrived, e.g. a wrong PIN.
+    refused: Option<String>,
 }
 
 impl eframe::App for ClientApp {
@@ -403,7 +419,12 @@ impl ClientApp {
                     self.file_status =
                         format!("{direction} {name}: {transferred}/{total} bytes ({state})");
                 }
-                UiEvent::Closed(text) => self.status = text,
+                UiEvent::Closed(text) => {
+                    if self.displays.is_empty() && self.refused.is_none() {
+                        self.refused = Some(text.clone());
+                    }
+                    self.status = text;
+                }
             }
         }
     }

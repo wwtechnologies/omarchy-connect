@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-connect.status",
+  "name": "Omarchy Connect",
+  "version": "0.1.0",
+  "author": "Omarchy Connect",
+  "license": "MIT",
+  "description": "Remote desktop host status, the address to connect to, and the unattended access PIN.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omarchy Connect",
+    "description": "See who is connected, copy this machine's address, and set the unattended access PIN.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

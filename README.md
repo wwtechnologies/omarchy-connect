@@ -1,10 +1,70 @@
 # Omarchy Connect
 
-Remote desktop from a Windows client to a host on Omarchy (Arch Linux, Hyprland, Wayland). This slice stays on the LAN. The host generates an ephemeral TLS certificate and prints the SHA-256 pin of that certificate. There are no accounts and no relay.
+Remote desktop from a Windows client to a host on Omarchy (Arch Linux, Hyprland, Wayland). This slice stays on the LAN. There are no accounts and no relay: the host has an unattended access PIN, set from its top bar, and the client types that PIN to connect.
 
 The host encodes H.264, preferring VAAPI (`h264_vaapi` through ffmpeg) when a render node is present and falling back to libx264. The client decodes with OpenH264 and draws every display on a native egui/wgpu surface. Keyboard and mouse are sent back to the host. One file can move in each direction on the same TLS session.
 
 `--demo` does not need a Wayland session. It sends two synthetic monitors so the protocol, decoder, and window can be exercised on a machine with no Hyprland.
+
+## Install on Omarchy
+
+```sh
+./install.sh
+```
+
+This builds the host in release mode and installs:
+
+- `~/.local/bin/omarchy-connect`, the host daemon and its CLI.
+- `~/.config/systemd/user/omarchy-connect.service`, enabled so the host starts with the graphical session.
+- `~/.config/omarchy/plugins/omarchy-connect.status`, a top bar icon placed before Bluetooth.
+- With sudo: `/etc/udev/rules.d/70-omarchy-connect-uinput.rules`, which lets the seat user write `/dev/uinput` so the remote keyboard and mouse work, and a ufw rule for TCP 47921 when ufw is active.
+
+`./install.sh --no-sudo` skips the udev and firewall steps. `./install.sh --uninstall` removes everything except `~/.config/omarchy-connect`. Rerun `./install.sh` after pulling to update.
+
+After the udev rule is installed for the first time, log out and back in (or reboot) if the panel still says `/dev/uinput` is not writable.
+
+### The bar icon
+
+Click the icon to open the panel. It shows:
+
+- Whether the host is running, waiting, or connected, and who is connected. **Disconnect** ends the session and the host keeps listening.
+- The addresses to type on the client. Click one to copy it.
+- The unattended access PIN. Saving a PIN turns unattended access on. The switch in the header turns access off without forgetting the PIN. **Remove PIN** forgets it.
+- **Pick screens again**, once a screen share has been saved.
+
+The icon is dim when access is off and highlighted while a client is connected. A desktop notification appears whenever a session starts.
+
+### The share picker
+
+xdg-desktop-portal-hyprland has no RemoteDesktop backend, so the host captures with the ScreenCast portal and injects input through uinput. The first connection shows Hyprland's share picker on the Omarchy screen. Pick the monitors and tick **Allow a restore token**. The host saves the token in `~/.local/state/omarchy-connect/` and later sessions start without the picker, which is what makes unattended access work. `screencopy { allow_token_by_default = true }` in `~/.config/hypr/xdph.conf` makes the token the default.
+
+### CLI
+
+The panel is a front end for the same commands:
+
+```sh
+omarchy-connect status            # add --json for the bar
+omarchy-connect pin set           # reads the PIN from stdin, or: pin set 482913
+omarchy-connect pin clear
+omarchy-connect unattended on|off
+omarchy-connect disconnect
+omarchy-connect reset-share       # show the picker again next time
+journalctl --user -u omarchy-connect -f
+```
+
+With no command, `omarchy-connect` runs the host in the foreground (`--help` lists the flags). Stop the service first if you want to run it by hand: `systemctl --user stop omarchy-connect`.
+
+## How the PIN works
+
+The host's TLS certificate is ephemeral and the client does not pin it. After TLS, both sides run SPAKE2 (Ed25519) keyed by the PIN and exchange HMAC confirmations over a TLS exporter value, so:
+
+- The PIN never crosses the network, even inside TLS.
+- A wrong PIN fails the confirmation, and the host learns only that one guess was wrong.
+- A machine in the middle cannot relay the exchange, because its two TLS legs have different exporter values. The client also rejects a host that cannot prove the PIN.
+
+The host allows five wrong PINs, then refuses all attempts for 30 s, doubling up to 15 minutes, until the right PIN is used. PINs are 6 to 32 characters without spaces. The PIN is stored verbatim in `~/.config/omarchy-connect/settings.json` with mode 0600, because SPAKE2 needs it.
+
+Anyone who knows the PIN can control the machine with nobody there to accept. Use a PIN you don't use elsewhere, and turn access off when you don't need it.
 
 ## Build
 
@@ -19,44 +79,33 @@ On Linux the host links libx264 and libpipewire-0.3. The client compiles OpenH26
 Terminal 1:
 
 ```sh
-cargo run --bin host -- --demo --bind 127.0.0.1:47921 --pin-file /tmp/omarchy-connect.pin
+cargo run --bin omarchy-connect -- --demo --bind 127.0.0.1:47921 --pin 482913
 ```
 
 Terminal 2:
 
 ```sh
-cargo run --bin client -- --connect 127.0.0.1:47921 --pin-file /tmp/omarchy-connect.pin
+cargo run --bin client -- --connect 127.0.0.1:47921 --pin 482913
 ```
 
-The window lays out each display from the session description. The demo desktop is `eDP-1` at 960×540, scale 100%, and `HDMI-A-1` at 960×540, origin x=960, scale 150%. A moving bar and the pointer (drawn into the pattern) show that frames and input are live.
+`--pin` on the host sets a fixed PIN for that run instead of the unattended settings. The window lays out each display from the session description. The demo desktop is `eDP-1` at 960×540, scale 100%, and `HDMI-A-1` at 960×540, origin x=960, scale 150%. A moving bar and the pointer (drawn into the pattern) show that frames and input are live.
 
 Headless, once the host is listening:
 
 ```sh
-cargo run --bin client -- --connect 127.0.0.1:47921 --pin-file /tmp/omarchy-connect.pin --headless --frames 12
+cargo run --bin client -- --connect 127.0.0.1:47921 --pin 482913 --headless --frames 12
 ```
 
 Files, both directions:
 
 ```sh
-cargo run --bin host -- --demo --bind 127.0.0.1:47921 --pin-file /tmp/omarchy-connect.pin \
+cargo run --bin omarchy-connect -- --demo --bind 127.0.0.1:47921 --pin 482913 \
   --offer-file ./notes.txt --download-dir downloads
-cargo run --bin client -- --connect 127.0.0.1:47921 --pin-file /tmp/omarchy-connect.pin \
+cargo run --bin client -- --connect 127.0.0.1:47921 --pin 482913 \
   --send-file ./photo.bin --download-dir downloads
 ```
 
-The client can also type a path and press Send file. Received files land in `--download-dir`.
-
-## Host on Omarchy
-
-```sh
-cargo run --bin host -- --bind 0.0.0.0:47921 --pin-file /tmp/omarchy-connect.pin \
-  --download-dir downloads --input auto
-```
-
-Without `--demo` the host opens an xdg-desktop-portal RemoteDesktop session and captures monitors through PipeWire. Hyprland needs `xdg-desktop-portal-hyprland`, and the portal dialog has to stay on a real session. `--input auto` injects the keyboard and pointer through that portal, and uses `/dev/uinput` only if portal input is not available. `--input none` captures without injecting.
-
-The protocol already describes N displays (bounds, scale, name). This slice captures every stream the portal returns. If the portal only offers the primary monitor, the client still lays out whatever list it receives.
+The client can also type a path and press Send file. Received files land in `--download-dir`. The installed host puts them in `~/Downloads/Omarchy Connect`.
 
 ## Windows client
 
@@ -74,7 +123,7 @@ rustup target add x86_64-pc-windows-gnu
 cargo build -p omarchy-client --target x86_64-pc-windows-gnu
 ```
 
-The binary is `target/x86_64-pc-windows-gnu/debug/client.exe`.
+The binary is `target/x86_64-pc-windows-gnu/debug/client.exe`. Enter the host address from the bar panel and the PIN. `client.exe --connect 10.0.0.5 --pin 482913` connects straight away, and `OMARCHY_CONNECT_PIN` works in place of `--pin`.
 
 ## Tests
 
@@ -82,16 +131,4 @@ The binary is `target/x86_64-pc-windows-gnu/debug/client.exe`.
 cargo test
 ```
 
-`crates/client/tests/demo_roundtrip.rs` starts a demo host, decodes frames from both monitors, and checks a file in each direction.
-
-## What was verified
-
-On a Linux machine with no Hyprland session and no `/dev/dri`:
-
-- `cargo test --workspace` passed, including the demo round trip.
-- `cargo run --bin host -- --demo --bind 127.0.0.1:47921 --pin-file /tmp/omarchy-connect.pin --offer-file /tmp/omarchy-demo/from-host.bin --download-dir /tmp/omarchy-demo/host-in --fps 12` listened and printed a pin.
-- `cargo run --bin client -- --connect 127.0.0.1:47921 --pin-file /tmp/omarchy-connect.pin --headless --frames 8 --send-file /tmp/omarchy-demo/from-client.bin --download-dir /tmp/omarchy-demo/client-in` printed two displays (`eDP-1` 960×540 scale 100%, `HDMI-A-1` 960×540 at x=960 scale 150%), 8 frames, motion on both, `sent ok`, and the two files arrived intact.
-- The same client without `--headless` opened a wgpu window (llvmpipe) and stayed up. That path needs `libxkbcommon-x11` under X11.
-- `cargo build -p omarchy-client --target x86_64-pc-windows-gnu` produced `target/x86_64-pc-windows-gnu/debug/client.exe`. It was not run on Windows. The MSVC target was not built here.
-
-Portal capture and VAAPI were not executed here. Both paths are in the host: portal capture starts an xdg-desktop-portal RemoteDesktop session and reads PipeWire, and the encoder uses `h264_vaapi` when a render node and ffmpeg encoder are present.
+`crates/client/tests/demo_roundtrip.rs` starts a demo host, decodes frames from both monitors, and checks a file in each direction. It also checks that the host refuses clients while unattended access is off, rejects a wrong PIN, and accepts the right one. `crates/protocol/src/auth.rs` tests the PIN exchange, including a split TLS session.

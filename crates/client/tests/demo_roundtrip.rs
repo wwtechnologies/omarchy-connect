@@ -1,9 +1,68 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
-use omarchy_client::{parse_pin, run_session, SessionConfig};
-use omarchy_host::{run_host, HostConfig, InputMode};
+use omarchy_client::{run_session, SessionConfig, SessionReport};
+use omarchy_host::settings::Settings;
+use omarchy_host::{run_host, HostConfig, HostReady, InputMode};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+const PIN: &str = "482913";
+
+fn demo_config(download_dir: PathBuf) -> HostConfig {
+    HostConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        demo: true,
+        fps: 12,
+        bitrate_kbps: 2000,
+        download_dir,
+        offer_file: None,
+        pin: None,
+        settings_path: None,
+        state_path: None,
+        restore_token: None,
+        input: InputMode::None,
+        notify: false,
+    }
+}
+
+async fn start_host(config: HostConfig, cancel: CancellationToken) -> (HostReady, JoinHandle<()>) {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let host = tokio::spawn(async move {
+        run_host(config, Some(ready_tx), cancel).await.unwrap();
+    });
+    let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx)
+        .await
+        .expect("host ready timeout")
+        .expect("host ready");
+    (ready, host)
+}
+
+async fn connect(
+    ready: &HostReady,
+    pin: &str,
+    download_dir: PathBuf,
+    send_file: Option<PathBuf>,
+) -> anyhow::Result<SessionReport> {
+    let (_keep_sender, commands) = tokio::sync::mpsc::unbounded_channel();
+    tokio::time::timeout(
+        Duration::from_secs(45),
+        run_session(
+            SessionConfig {
+                addr: ready.addr,
+                pin: pin.into(),
+                download_dir,
+                send_file,
+                stop_after_frames: Some(6),
+            },
+            commands,
+            None,
+        ),
+    )
+    .await
+    .expect("session timeout")
+}
 
 #[tokio::test]
 async fn demo_roundtrip_frames_and_files() {
@@ -21,53 +80,18 @@ async fn demo_roundtrip_frames_and_files() {
     std::fs::write(&client_file, &client_bytes).unwrap();
 
     let cancel = CancellationToken::new();
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let host_cancel = cancel.clone();
-    let host = tokio::spawn(async move {
-        run_host(
-            HostConfig {
-                bind: "127.0.0.1:0".parse().unwrap(),
-                demo: true,
-                fps: 12,
-                bitrate_kbps: 2000,
-                download_dir: host_down.clone(),
-                offer_file: Some(host_file),
-                pin_file: None,
-                input: InputMode::None,
-            },
-            Some(ready_tx),
-            host_cancel,
-        )
+    let config = HostConfig {
+        offer_file: Some(host_file),
+        pin: Some(PIN.into()),
+        ..demo_config(host_down.clone())
+    };
+    let (ready, host) = start_host(config, cancel.clone()).await;
+    let report = connect(&ready, PIN, client_down, Some(client_file))
         .await
-        .unwrap();
-        host_down
-    });
-
-    let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx)
-        .await
-        .expect("host ready timeout")
-        .expect("host ready");
-    let (_keep_sender, commands) = tokio::sync::mpsc::unbounded_channel();
-    let report = tokio::time::timeout(
-        Duration::from_secs(45),
-        run_session(
-            SessionConfig {
-                addr: ready.addr,
-                pin: parse_pin(&ready.pin).unwrap(),
-                download_dir: client_down,
-                send_file: Some(client_file),
-                stop_after_frames: Some(6),
-            },
-            commands,
-            None,
-        ),
-    )
-    .await
-    .expect("session timeout")
-    .expect("session");
+        .expect("session");
 
     cancel.cancel();
-    let host_down = tokio::time::timeout(Duration::from_secs(10), host)
+    tokio::time::timeout(Duration::from_secs(10), host)
         .await
         .expect("host shutdown")
         .expect("host task");
@@ -88,4 +112,54 @@ async fn demo_roundtrip_frames_and_files() {
     assert_eq!(received, host_bytes);
     let saved = std::fs::read(host_down.join("from-client.bin")).unwrap();
     assert_eq!(saved, client_bytes);
+}
+
+#[tokio::test]
+async fn unattended_settings_gate_the_pin() {
+    std::env::set_var("OMARCHY_FORCE_X264", "1");
+    let dir = tempfile::tempdir().unwrap();
+    let settings_path = dir.path().join("settings.json");
+    let state_path = dir.path().join("state.json");
+    let cancel = CancellationToken::new();
+    let config = HostConfig {
+        settings_path: Some(settings_path.clone()),
+        state_path: Some(state_path.clone()),
+        ..demo_config(dir.path().join("host-in"))
+    };
+    let (ready, host) = start_host(config, cancel.clone()).await;
+    let down = dir.path().join("client-in");
+
+    let err = connect(&ready, PIN, down.clone(), None).await.unwrap_err();
+    assert!(err.to_string().contains("Unattended access is off"), "{err}");
+
+    Settings {
+        unattended: true,
+        pin: Some(PIN.into()),
+    }
+    .save(&settings_path)
+    .unwrap();
+    let err = connect(&ready, "111111", down.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Wrong PIN"), "{err}");
+
+    let report = connect(&ready, PIN, down.clone(), None).await.expect("session");
+    assert!(report.frames_decoded >= 6, "{report}");
+    assert!(state_path.exists());
+
+    Settings {
+        unattended: false,
+        pin: Some(PIN.into()),
+    }
+    .save(&settings_path)
+    .unwrap();
+    let err = connect(&ready, PIN, down, None).await.unwrap_err();
+    assert!(err.to_string().contains("Unattended access is off"), "{err}");
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(10), host)
+        .await
+        .expect("host shutdown")
+        .expect("host task");
+    assert!(!state_path.exists(), "state file is removed on shutdown");
 }

@@ -1,8 +1,8 @@
 //! Omarchy Connect client.
 //!
-//! Connects to a host, pins its ephemeral TLS certificate, decodes H.264, and
-//! draws each display on a native egui/wgpu surface. File bytes share that
-//! TLS session.
+//! Connects to a host over TLS, proves the host's unattended PIN, decodes
+//! H.264, and draws each display on a native egui/wgpu surface. File bytes
+//! share that TLS session.
 
 mod app;
 mod decode;

@@ -13,12 +13,9 @@ struct Args {
     /// Host address. `192.168.1.10` uses port 47921.
     #[arg(long)]
     connect: Option<String>,
-    /// Certificate pin printed by the host. Hex SHA-256, optional `pin ` prefix.
-    #[arg(long)]
+    /// Unattended access PIN set on the host. `OMARCHY_CONNECT_PIN` also works.
+    #[arg(long, env = "OMARCHY_CONNECT_PIN", hide_env_values = true)]
     pin: Option<String>,
-    /// File written by the host `--pin-file`.
-    #[arg(long)]
-    pin_file: Option<PathBuf>,
     #[arg(long, default_value = "downloads")]
     download_dir: PathBuf,
     /// Send this file to the host after connecting.
@@ -40,23 +37,14 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let pin_text = if let Some(text) = args.pin {
-        Some(text)
-    } else if let Some(path) = args.pin_file {
-        Some(
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("read pin {}", path.display()))?,
-        )
-    } else {
-        None
-    };
+    let pin_text = args.pin;
 
     if args.headless {
         let connect = args
             .connect
             .as_deref()
             .context("headless mode needs --connect")?;
-        let pin_text = pin_text.as_deref().context("headless mode needs --pin or --pin-file")?;
+        let pin_text = pin_text.as_deref().context("headless mode needs --pin")?;
         let config = SessionConfig {
             addr: parse_host(connect)?,
             pin: parse_pin(pin_text)?,

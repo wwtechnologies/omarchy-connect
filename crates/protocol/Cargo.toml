@@ -7,7 +7,9 @@ publish.workspace = true
 description = "Wire protocol for Omarchy Connect"
 
 [dependencies]
+hmac = "0.12"
 sha2 = "0.10"
+spake2 = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util"] }
 

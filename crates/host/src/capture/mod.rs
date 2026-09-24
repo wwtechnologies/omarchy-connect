@@ -6,7 +6,7 @@ mod portal;
 pub use synthetic::{demo_displays, SyntheticDesktop, DEMO_HEIGHT, DEMO_WIDTH};
 
 #[cfg(target_os = "linux")]
-pub use portal::{open_portal, PortalCapture, PortalInput};
+pub use portal::{default_token_path, open_portal, PortalCapture};
 
 use crate::input::Cursor;
 

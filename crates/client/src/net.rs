@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Sender, SyncSender};
 
 use anyhow::Context;
+use omarchy_protocol::auth::{PinExchange, Side, TLS_EXPORTER_LABEL};
 use omarchy_protocol::{
     read_message, write_message, DisplayInfo, FileReceiver, FileSender, FileTransferError,
     InputEvent, Message, ProtocolError, VERSION,
@@ -19,12 +20,14 @@ use crate::tls;
 
 pub struct SessionConfig {
     pub addr: SocketAddr,
-    pub pin: [u8; 32],
+    /// Unattended access PIN set on the host.
+    pub pin: String,
     pub download_dir: PathBuf,
     pub send_file: Option<PathBuf>,
     pub stop_after_frames: Option<u32>,
 }
 
+#[derive(Debug)]
 pub struct SessionReport {
     pub displays: Vec<DisplayInfo>,
     pub frames_decoded: u32,
@@ -108,14 +111,53 @@ pub fn parse_host(text: &str) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("resolve {text}"))
 }
 
-pub fn parse_pin(text: &str) -> anyhow::Result<[u8; 32]> {
-    let text = text.trim();
-    let text = text.strip_prefix("pin ").unwrap_or(text).trim();
-    let bytes = hex::decode(text).context("pin is not hex")?;
-    let len = bytes.len();
-    bytes
-        .try_into()
-        .map_err(|_: Vec<u8>| anyhow::anyhow!("pin is {len} bytes, expected 32"))
+pub fn parse_pin(text: &str) -> anyhow::Result<String> {
+    if text.trim().is_empty() {
+        anyhow::bail!("enter the host PIN");
+    }
+    omarchy_protocol::auth::validate_pin(text)
+        .map(str::to_string)
+        .map_err(anyhow::Error::msg)
+}
+
+fn client_name() -> String {
+    ["COMPUTERNAME", "HOSTNAME"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|name| !name.is_empty()))
+        .unwrap_or_else(|| "omarchy-client".into())
+}
+
+async fn authenticate<S>(tls: &mut S, pin: &str, binding: &[u8]) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (exchange, outbound) = PinExchange::start(Side::Client, pin);
+    write_message(tls, &Message::Auth { spake2: outbound })
+        .await
+        .context("write auth")?;
+    let host_msg = match read_message(tls).await.context("read auth")? {
+        Message::Auth { spake2 } => spake2,
+        Message::AuthDenied { reason, .. } => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!("expected auth"),
+    };
+    let keys = exchange
+        .finish(&host_msg, binding)
+        .map_err(|_| anyhow::anyhow!("host sent a malformed PIN exchange"))?;
+    write_message(
+        tls,
+        &Message::AuthConfirm {
+            mac: keys.confirmation(),
+        },
+    )
+    .await
+    .context("write auth confirm")?;
+    match read_message(tls).await.context("read auth confirm")? {
+        Message::AuthConfirm { mac } => keys
+            .verify_peer(&mac)
+            .map_err(|_| anyhow::anyhow!("the host could not prove the PIN; this may not be your host")),
+        Message::AuthDenied { reason, .. } => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!("expected auth confirm"),
+    }
 }
 
 pub async fn run_session(
@@ -125,7 +167,7 @@ pub async fn run_session(
 ) -> anyhow::Result<SessionReport> {
     let outcome = session(&config, &mut commands, ui.as_ref()).await;
     if let Err(err) = &outcome {
-        emit(ui.as_ref(), UiEvent::Closed(err.to_string()));
+        emit(ui.as_ref(), UiEvent::Closed(format!("{err:#}")));
     }
     outcome
 }
@@ -145,17 +187,17 @@ async fn session(
         .await
         .with_context(|| format!("connect {}", config.addr))?;
     tcp.set_nodelay(true).ok();
-    let connector = TlsConnector::from(tls::client_config(config.pin));
+    let connector = TlsConnector::from(tls::client_config());
     let name = ServerName::try_from("omarchy-connect").context("server name")?;
     let mut tls = connector
         .connect(name, tcp)
         .await
-        .context("tls handshake (pin mismatch or the host closed)")?;
+        .context("tls handshake")?;
     write_message(
         &mut tls,
         &Message::Hello {
             version: VERSION,
-            name: "omarchy-client".into(),
+            name: client_name(),
         },
     )
     .await
@@ -165,8 +207,16 @@ async fn session(
         Message::HelloAck { version } => {
             anyhow::bail!("host protocol version {version}, client is {VERSION}");
         }
+        Message::AuthDenied { reason, .. } => anyhow::bail!("{reason}"),
         _ => anyhow::bail!("expected hello ack"),
     }
+    emit(ui, UiEvent::Status("Checking PIN".into()));
+    let binding: [u8; 32] = tls
+        .get_ref()
+        .1
+        .export_keying_material([0u8; 32], TLS_EXPORTER_LABEL, None)
+        .context("tls exporter")?;
+    authenticate(&mut tls, &config.pin, &binding).await?;
 
     let (mut reader, mut writer) = split(tls);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Message>(64);

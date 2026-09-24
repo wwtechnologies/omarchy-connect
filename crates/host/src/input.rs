@@ -2,8 +2,8 @@
 //!
 //! Demo mode draws the cursor into the test pattern and does not touch the
 //! local seat unless `--input uinput` is set. A portal capture injects through
-//! the remote-desktop portal. uinput is the fallback when `/dev/uinput` is
-//! available and portal input is not selected.
+//! `/dev/uinput`: xdg-desktop-portal-hyprland has no RemoteDesktop backend.
+//! The installer adds a udev rule that gives the seat user access to it.
 
 use std::collections::HashMap;
 
@@ -22,8 +22,6 @@ pub enum Injector {
     None,
     #[cfg(target_os = "linux")]
     Uinput(UinputDevice),
-    #[cfg(target_os = "linux")]
-    Portal(crate::capture::PortalInput),
 }
 
 impl Injector {
@@ -36,8 +34,6 @@ impl Injector {
                     tracing::warn!(error = %err, "uinput");
                 }
             }
-            #[cfg(target_os = "linux")]
-            Injector::Portal(portal) => portal.apply(event.clone()).await,
         }
     }
 }
