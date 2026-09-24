@@ -135,11 +135,15 @@ impl std::fmt::Display for Report {
             (false, _) => "off",
         };
         writeln!(f, "Unattended access: {access}")?;
-        writeln!(
-            f,
-            "Video: {} fps at {} kb/s",
-            self.fps, self.bitrate_kbps
-        )?;
+        if self.bitrate_kbps == 0 {
+            writeln!(f, "Video: {} fps, bitrate automatic", self.fps)?;
+        } else {
+            writeln!(
+                f,
+                "Video: {} fps at {} kb/s",
+                self.fps, self.bitrate_kbps
+            )?;
+        }
         if self.locked_secs > 0 {
             writeln!(f, "Locked for {} s after wrong PINs", self.locked_secs)?;
         }

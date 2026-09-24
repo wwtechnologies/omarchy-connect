@@ -26,7 +26,7 @@ pub struct Settings {
     /// Capture and encode rate. Applied when the next client connects.
     #[serde(default = "default_fps")]
     pub fps: u32,
-    /// Encoder target in kilobits per second.
+    /// Encoder target in kilobits per second. Zero means automatic.
     #[serde(default = "default_bitrate_kbps")]
     pub bitrate_kbps: u32,
 }
@@ -75,8 +75,14 @@ impl Settings {
     }
 
     /// Frame rate and bitrate for the next connection, clamped to a usable range.
+    /// A bitrate of zero is automatic.
     pub fn video(&self) -> (u32, u32) {
-        (self.fps.clamp(1, 60), self.bitrate_kbps.clamp(500, 50_000))
+        let bitrate = if self.bitrate_kbps == 0 {
+            0
+        } else {
+            self.bitrate_kbps.clamp(500, 50_000)
+        };
+        (self.fps.clamp(1, 60), bitrate)
     }
 
     /// The PIN a client must prove, or `None` when unattended access is off.
@@ -113,6 +119,11 @@ mod tests {
         assert_eq!(settings.active_pin(), Some("482913"));
         assert_eq!(settings.video(), (60, 12_000));
         assert_eq!(Settings::default().video(), (15, 4_000));
+        let auto = Settings {
+            bitrate_kbps: 0,
+            ..Settings::default()
+        };
+        assert_eq!(auto.video(), (15, 0));
         let off = Settings {
             unattended: false,
             ..settings

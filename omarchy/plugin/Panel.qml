@@ -32,7 +32,7 @@ Panel {
   readonly property var addresses: Array.isArray(info.addresses) ? info.addresses : []
   readonly property int port: info.port || 47921
   readonly property int fps: info.fps || 15
-  readonly property int bitrateKbps: info.bitrate_kbps || 4000
+  readonly property int bitrateKbps: info.bitrate_kbps === undefined ? 4000 : info.bitrate_kbps
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -435,23 +435,17 @@ Panel {
             font.pixelSize: Style.font.caption
           }
 
-          Row {
+          Flow {
+            width: parent.width
             spacing: Style.space(6)
+
             Button {
-              text: "4 Mb/s"
-              bordered: root.bitrateKbps === 4000
+              text: "Auto"
+              bordered: root.bitrateKbps === 0
               foreground: root.foreground
               fontFamily: root.fontFamily
               enabled: !root.busy
-              onClicked: root.setVideo(root.fps, 4000)
-            }
-            Button {
-              text: "8 Mb/s"
-              bordered: root.bitrateKbps === 8000
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              enabled: !root.busy
-              onClicked: root.setVideo(root.fps, 8000)
+              onClicked: root.setVideo(root.fps, 0)
             }
             Button {
               text: "12 Mb/s"
@@ -461,12 +455,28 @@ Panel {
               enabled: !root.busy
               onClicked: root.setVideo(root.fps, 12000)
             }
+            Button {
+              text: "25 Mb/s"
+              bordered: root.bitrateKbps === 25000
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: !root.busy
+              onClicked: root.setVideo(root.fps, 25000)
+            }
+            Button {
+              text: "50 Mb/s"
+              bordered: root.bitrateKbps === 50000
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: !root.busy
+              onClicked: root.setVideo(root.fps, 50000)
+            }
           }
 
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: "Higher frame rate is smoother and lower latency. It applies the next time someone connects."
+            text: "Auto starts near 25 Mb/s for 1080p and steps down if the client falls behind. A fixed rate applies the next time someone connects."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

@@ -258,8 +258,8 @@ fn video(fps: Option<u32>, bitrate_kbps: Option<u32>) -> anyhow::Result<()> {
         settings.fps = fps;
     }
     if let Some(bitrate_kbps) = bitrate_kbps {
-        if !(500..=50_000).contains(&bitrate_kbps) {
-            anyhow::bail!("bitrate must be from 500 to 50000 kb/s");
+        if bitrate_kbps != 0 && !(500..=50_000).contains(&bitrate_kbps) {
+            anyhow::bail!("bitrate must be 0 (automatic) or from 500 to 50000 kb/s");
         }
         settings.bitrate_kbps = bitrate_kbps;
     }
@@ -267,7 +267,11 @@ fn video(fps: Option<u32>, bitrate_kbps: Option<u32>) -> anyhow::Result<()> {
         settings.save(&path)?;
     }
     let (fps, bitrate_kbps) = settings.video();
-    println!("Video is {fps} fps at {bitrate_kbps} kb/s. The next connection uses this.");
+    if bitrate_kbps == 0 {
+        println!("Video is {fps} fps with automatic bitrate. The next connection uses this.");
+    } else {
+        println!("Video is {fps} fps at {bitrate_kbps} kb/s. The next connection uses this.");
+    }
     Ok(())
 }
 

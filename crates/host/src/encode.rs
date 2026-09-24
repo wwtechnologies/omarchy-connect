@@ -42,7 +42,7 @@ impl Encoder {
         }
         let backend = if force_x264() {
             Backend::X264(X264Encoder::open(width, height, fps, bitrate_kbps)?)
-        } else if let Some(vaapi) = VaapiEncoder::try_open(width, height, fps) {
+        } else if let Some(vaapi) = VaapiEncoder::try_open(width, height, fps, bitrate_kbps) {
             tracing::info!(width, height, "encoder: h264_vaapi");
             Backend::Vaapi(vaapi)
         } else {
@@ -163,12 +163,12 @@ struct VaapiEncoder {
 }
 
 impl VaapiEncoder {
-    fn try_open(width: u32, height: u32, fps: u32) -> Option<Self> {
+    fn try_open(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Option<Self> {
         let device = render_node()?;
         if !ffmpeg_has_h264_vaapi() {
             return None;
         }
-        match Self::spawn(&device, width, height, fps) {
+        match Self::spawn(&device, width, height, fps, bitrate_kbps) {
             Ok(enc) => Some(enc),
             Err(err) => {
                 tracing::info!(error = %err, "vaapi encoder unavailable");
@@ -177,10 +177,19 @@ impl VaapiEncoder {
         }
     }
 
-    fn spawn(device: &std::path::Path, width: u32, height: u32, fps: u32) -> anyhow::Result<Self> {
+    fn spawn(
+        device: &std::path::Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> anyhow::Result<Self> {
         let gop = (fps.max(1) * 2).to_string();
         let size = format!("{width}x{height}");
         let rate = fps.max(1).to_string();
+        let bitrate = format!("{}k", bitrate_kbps.max(500));
+        // One frame of VBV so a higher rate does not sit in an encoder buffer.
+        let bufsize = format!("{}k", (bitrate_kbps.max(500) / fps.max(1)).max(100));
         let device = device.display().to_string();
         let mut child = Command::new("ffmpeg")
             .args([
@@ -217,8 +226,12 @@ impl VaapiEncoder {
                 "1",
                 "-g",
                 &gop,
-                "-qp",
-                "23",
+                "-b:v",
+                &bitrate,
+                "-maxrate",
+                &bitrate,
+                "-bufsize",
+                &bufsize,
                 "-f",
                 "h264",
                 "pipe:1",
