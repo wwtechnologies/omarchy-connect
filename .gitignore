@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+omarchy-connect.pin
+/downloads
+/agent-tools/
