@@ -17,9 +17,9 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
-use crate::capture::{self, RawFrame, SyntheticDesktop};
+use crate::capture::{self, CaptureMode, RawFrame, SyntheticDesktop};
 use crate::encode::Encoder;
-use crate::input::{Cursor, Injector};
+use crate::input::{Cursor, Injector, Region};
 use crate::lockout::Lockout;
 use crate::settings::Settings;
 use crate::state::{unix_now, LiveState, Publisher, Status};
@@ -44,9 +44,10 @@ pub struct HostConfig {
     pub settings_path: Option<PathBuf>,
     /// Live status JSON for the bar.
     pub state_path: Option<PathBuf>,
-    /// Portal restore token, so the share picker only appears once.
+    /// Portal restore token, for when capture falls back to the share picker.
     pub restore_token: Option<PathBuf>,
     pub input: InputMode,
+    pub capture: CaptureMode,
     /// Desktop notification when a session starts.
     pub notify: bool,
 }
@@ -114,7 +115,7 @@ pub async fn run_host(
     if config.demo {
         println!("capture demo (synthetic displays)");
     } else {
-        println!("capture xdg-desktop-portal / pipewire");
+        println!("capture {:?} (every monitor through wlr-screencopy, else the portal picker)", config.capture);
     }
     if let Some(tx) = ready {
         let _ = tx.send(HostReady { addr });
@@ -273,34 +274,39 @@ async fn handle_client(
     let cursor = capture::cursor_handle();
     let displays;
     let injector;
-    let mut portal_frames: Option<tokio::sync::mpsc::Receiver<RawFrame>> = None;
+    let mut live_frames: Option<tokio::sync::mpsc::Receiver<RawFrame>> = None;
     // Dropping this sets the PipeWire stop flag. It has to outlive the frame loop.
     #[cfg(target_os = "linux")]
-    let mut portal_guard: Option<capture::PortalCapture> = None;
+    let mut capture_guard: Option<capture::LiveCapture> = None;
 
     if config.demo {
         displays = capture::demo_displays();
-        injector = build_injector(config.input, true, &displays);
+        let regions: Vec<Region> = displays.iter().map(Region::unscaled).collect();
+        injector = build_injector(config.input, true, &regions);
     } else {
         #[cfg(target_os = "linux")]
         {
-            let mut portal = tokio::select! {
+            let mut live = tokio::select! {
                 _ = session_cancel.cancelled() => {
                     writer_task.abort();
                     return Ok(());
                 }
-                opened = capture::open_portal(config.restore_token.as_deref()) => opened.context(
-                    "screen share failed. On Omarchy this needs Hyprland and xdg-desktop-portal-hyprland. Use --demo without a portal."
+                opened = capture::LiveCapture::open(
+                    config.capture,
+                    config.fps,
+                    config.restore_token.as_deref(),
+                ) => opened.context(
+                    "screen capture failed. On Omarchy this needs Hyprland (wlr-screencopy or xdg-desktop-portal-hyprland). Use --demo without a desktop."
                 )?,
             };
-            displays = portal.displays.clone();
-            portal_frames = Some(portal.take_frames());
-            injector = build_injector(config.input, false, &displays);
-            portal_guard = Some(portal);
+            displays = live.displays().to_vec();
+            live_frames = Some(live.take_frames());
+            injector = build_injector(config.input, false, &live.regions());
+            capture_guard = Some(live);
         }
         #[cfg(not(target_os = "linux"))]
         {
-            anyhow::bail!("portal capture requires linux. Use --demo.");
+            anyhow::bail!("live capture requires linux. Use --demo.");
         }
     }
     publisher.update(|s| s.status = Status::Connected);
@@ -316,11 +322,11 @@ async fn handle_client(
         cursor,
         displays,
         injector,
-        portal_frames,
+        live_frames,
     )
     .await;
     #[cfg(target_os = "linux")]
-    drop(portal_guard);
+    drop(capture_guard);
     result
 }
 
@@ -431,7 +437,7 @@ async fn drive_session(
     cursor: Arc<Mutex<Cursor>>,
     mut displays: Vec<DisplayInfo>,
     injector: Injector,
-    mut portal_frames: Option<tokio::sync::mpsc::Receiver<RawFrame>>,
+    mut live_frames: Option<tokio::sync::mpsc::Receiver<RawFrame>>,
 ) -> anyhow::Result<()> {
     ctrl_tx
         .send(Message::Displays {
@@ -520,7 +526,7 @@ async fn drive_session(
                     pts = pts.wrapping_add(1000 / u64::from(config.fps.max(1)));
                 }
             }
-            frame = recv_portal(&mut portal_frames) => {
+            frame = recv_live(&mut live_frames) => {
                 let Some(frame) = frame else { break };
                 if let Some(display) = displays.iter_mut().find(|d| d.id == frame.display_id) {
                     if display.width != frame.width || display.height != frame.height {
@@ -542,7 +548,7 @@ async fn drive_session(
     Ok(())
 }
 
-async fn recv_portal(
+async fn recv_live(
     frames: &mut Option<tokio::sync::mpsc::Receiver<RawFrame>>,
 ) -> Option<RawFrame> {
     match frames {
@@ -582,26 +588,26 @@ async fn send_frame(
     Ok(())
 }
 
-fn build_injector(mode: InputMode, demo: bool, displays: &[DisplayInfo]) -> Injector {
+fn build_injector(mode: InputMode, demo: bool, regions: &[Region]) -> Injector {
     match mode {
         InputMode::None => Injector::None,
         InputMode::Auto if demo => {
             tracing::info!("demo mode draws the pointer into the test pattern");
             Injector::None
         }
-        InputMode::Auto | InputMode::Uinput => open_uinput_or_none(displays),
+        InputMode::Auto | InputMode::Uinput => open_uinput_or_none(regions),
     }
 }
 
-fn open_uinput_or_none(displays: &[DisplayInfo]) -> Injector {
+fn open_uinput_or_none(regions: &[Region]) -> Injector {
     #[cfg(target_os = "linux")]
     {
-        match crate::input::open_uinput(displays) {
+        match crate::input::open_uinput(regions) {
             Ok(device) => return Injector::Uinput(device),
             Err(err) => tracing::warn!(error = %err, "uinput unavailable"),
         }
     }
-    let _ = displays;
+    let _ = regions;
     Injector::None
 }
 

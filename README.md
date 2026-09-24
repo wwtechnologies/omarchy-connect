@@ -30,13 +30,15 @@ Click the icon to open the panel. It shows:
 - Whether the host is running, waiting, or connected, and who is connected. **Disconnect** ends the session and the host keeps listening.
 - The addresses to type on the client. Click one to copy it.
 - The unattended access PIN. Saving a PIN turns unattended access on. The switch in the header turns access off without forgetting the PIN. **Remove PIN** forgets it.
-- **Pick screens again**, once a screen share has been saved.
+- **Pick screens again**, only when the host fell back to the portal picker and saved a choice.
 
 The icon is dim when access is off and highlighted while a client is connected. A desktop notification appears whenever a session starts.
 
-### The share picker
+### Screens
 
-xdg-desktop-portal-hyprland has no RemoteDesktop backend, so the host captures with the ScreenCast portal and injects input through uinput. The first connection shows Hyprland's share picker on the Omarchy screen. Pick the monitors and tick **Allow a restore token**. The host saves the token in `~/.local/state/omarchy-connect/` and later sessions start without the picker, which is what makes unattended access work. `screencopy { allow_token_by_default = true }` in `~/.config/hypr/xdph.conf` makes the token the default.
+Every connection shares every monitor, with no picker. The host captures each output directly with Hyprland's wlr-screencopy protocol, reading the monitor list when the session starts, so a monitor plugged in mid-session shows up on the next connection. Scaled monitors are sent at their native resolution and the pointer is mapped through Hyprland's logical layout. Input goes through uinput, because xdg-desktop-portal-hyprland has no RemoteDesktop backend.
+
+If the compositor has no wlr-screencopy, the host falls back to the ScreenCast portal. That shows Hyprland's share picker, which allows one monitor. Tick **Allow a restore token** and later sessions skip it. `--capture portal` forces the picker and `--capture screencopy` refuses to fall back.
 
 ### CLI
 
@@ -48,7 +50,7 @@ omarchy-connect pin set           # reads the PIN from stdin, or: pin set 482913
 omarchy-connect pin clear
 omarchy-connect unattended on|off
 omarchy-connect disconnect
-omarchy-connect reset-share       # show the picker again next time
+omarchy-connect reset-share       # portal fallback only: show the picker again
 journalctl --user -u omarchy-connect -f
 ```
 

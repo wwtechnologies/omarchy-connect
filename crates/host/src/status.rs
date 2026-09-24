@@ -112,7 +112,7 @@ impl std::fmt::Display for Report {
             "listening" => writeln!(f, "Omarchy Connect is waiting for a connection")?,
             "sharing" => writeln!(
                 f,
-                "{} is connecting; waiting for the share picker",
+                "{} is connecting; starting screen capture",
                 self.peer.as_deref().unwrap_or("A client")
             )?,
             _ => writeln!(

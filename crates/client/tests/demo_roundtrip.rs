@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use omarchy_client::{run_session, SessionConfig, SessionReport};
 use omarchy_host::settings::Settings;
-use omarchy_host::{run_host, HostConfig, HostReady, InputMode};
+use omarchy_host::{run_host, CaptureMode, HostConfig, HostReady, InputMode};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +23,7 @@ fn demo_config(download_dir: PathBuf) -> HostConfig {
         state_path: None,
         restore_token: None,
         input: InputMode::None,
+        capture: CaptureMode::Auto,
         notify: false,
     }
 }

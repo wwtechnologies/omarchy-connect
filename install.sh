@@ -125,7 +125,5 @@ sleep 1
 cat <<EOF
 
 Click the Omarchy Connect icon in the top bar to set the unattended PIN.
-The first connection shows the screen share picker on this machine; tick
-"Allow a restore token" (or keep screencopy:allow_token_by_default in
-~/.config/hypr/xdph.conf) and later sessions start without it.
+Every monitor is shared on each connection, with no screen share picker.
 EOF

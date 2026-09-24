@@ -23,4 +23,5 @@ pub const DEFAULT_PORT: u16 = 47921;
 pub use capture::{demo_displays, DEMO_HEIGHT, DEMO_WIDTH};
 #[cfg(target_os = "linux")]
 pub use capture::default_token_path;
+pub use capture::CaptureMode;
 pub use session::{run_host, HostConfig, HostReady, InputMode};

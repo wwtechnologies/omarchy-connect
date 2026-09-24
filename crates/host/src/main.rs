@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use omarchy_host::settings::Settings;
-use omarchy_host::{paths, run_host, status, HostConfig, InputMode};
+use omarchy_host::{paths, run_host, status, CaptureMode, HostConfig, InputMode};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -40,7 +40,7 @@ enum Command {
     Unattended { state: OnOff },
     /// End the current remote session. The host keeps listening.
     Disconnect,
-    /// Forget the saved screen share so the picker appears on the next session.
+    /// Forget the saved portal screen share so its picker appears next time.
     ResetShare,
 }
 
@@ -63,7 +63,7 @@ struct ServeArgs {
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0:47921")]
     bind: SocketAddr,
-    /// Two synthetic monitors instead of the xdg-desktop-portal capture.
+    /// Two synthetic monitors instead of capturing the desktop.
     #[arg(long)]
     demo: bool,
     #[arg(long, default_value_t = 15)]
@@ -82,6 +82,10 @@ struct ServeArgs {
     /// auto, uinput, or none. Demo mode draws the pointer into the pattern.
     #[arg(long, default_value = "auto")]
     input: String,
+    /// auto, screencopy, or portal. Screencopy shares every monitor with no
+    /// picker; auto falls back to the portal picker when it is missing.
+    #[arg(long, default_value = "auto")]
+    capture: String,
     /// No desktop notification when a session starts.
     #[arg(long)]
     no_notify: bool,
@@ -122,6 +126,7 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         state_path: paths::state_file(),
         restore_token: token_path(),
         input: InputMode::parse(&args.input).context("input mode")?,
+        capture: CaptureMode::parse(&args.capture).context("capture mode")?,
         notify: !args.no_notify,
     };
     let cancel = CancellationToken::new();

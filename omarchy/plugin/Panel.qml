@@ -327,7 +327,7 @@ Panel {
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: root.status === "sharing"
-                  ? "Waiting for the screen share picker"
+                  ? "Starting screen capture"
                   : (root.info.since ? "Since " + Qt.formatTime(new Date(root.info.since * 1000), "HH:mm") : "")
                 color: root.dim
                 font.family: root.fontFamily

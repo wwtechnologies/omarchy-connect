@@ -2362,6 +2362,9 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "x264",
 ]
 

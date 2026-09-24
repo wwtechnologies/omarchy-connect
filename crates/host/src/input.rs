@@ -1,7 +1,7 @@
 //! Pointer and keyboard injection.
 //!
 //! Demo mode draws the cursor into the test pattern and does not touch the
-//! local seat unless `--input uinput` is set. A portal capture injects through
+//! local seat unless `--input uinput` is set. A live capture injects through
 //! `/dev/uinput`: xdg-desktop-portal-hyprland has no RemoteDesktop backend.
 //! The installer adds a udev rule that gives the seat user access to it.
 
@@ -9,6 +9,46 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use omarchy_protocol::{keys, DisplayInfo, InputEvent};
+
+/// Where a display sits in the compositor's logical layout. Video pixels
+/// divide down to logical units when the monitor is scaled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub id: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+impl Region {
+    /// For captures whose display origins are already in layout units.
+    pub fn unscaled(display: &DisplayInfo) -> Self {
+        Self {
+            id: display.id,
+            x: display.x,
+            y: display.y,
+            width: display.width,
+            height: display.height,
+            pixel_width: display.width,
+            pixel_height: display.height,
+        }
+    }
+
+    fn to_layout(self, x: u32, y: u32) -> (i64, i64) {
+        let lx = self.x as i64 * SUBPIXEL
+            + x as i64 * self.width as i64 * SUBPIXEL / self.pixel_width.max(1) as i64;
+        let ly = self.y as i64 * SUBPIXEL
+            + y as i64 * self.height as i64 * SUBPIXEL / self.pixel_height.max(1) as i64;
+        (lx, ly)
+    }
+}
+
+/// Absolute axis steps per logical pixel, so scaled monitors keep full
+/// pointer precision.
+const SUBPIXEL: i64 = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cursor {
@@ -39,39 +79,47 @@ impl Injector {
 }
 
 #[cfg(target_os = "linux")]
-pub fn open_uinput(displays: &[DisplayInfo]) -> anyhow::Result<UinputDevice> {
-    UinputDevice::open(displays)
+pub fn open_uinput(regions: &[Region]) -> anyhow::Result<UinputDevice> {
+    UinputDevice::open(regions)
 }
 
 #[cfg(target_os = "linux")]
 pub struct UinputDevice {
     device: evdev::uinput::VirtualDevice,
-    origins: HashMap<u32, (i32, i32)>,
-    min_x: i32,
-    min_y: i32,
-    max_x: i32,
-    max_y: i32,
+    regions: HashMap<u32, Region>,
+    min_x: i64,
+    min_y: i64,
+    max_x: i64,
+    max_y: i64,
 }
 
 #[cfg(target_os = "linux")]
 impl UinputDevice {
-    fn open(displays: &[DisplayInfo]) -> anyhow::Result<Self> {
+    fn open(regions: &[Region]) -> anyhow::Result<Self> {
         use evdev::{
             uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, KeyCode,
             RelativeAxisCode, UinputAbsSetup,
         };
 
-        let min_x = displays.iter().map(|d| d.x).min().unwrap_or(0);
-        let min_y = displays.iter().map(|d| d.y).min().unwrap_or(0);
-        let max_x = displays
+        let min_x = regions
             .iter()
-            .map(|d| d.x.saturating_add(d.width as i32).saturating_sub(1))
+            .map(|r| r.x as i64 * SUBPIXEL)
+            .min()
+            .unwrap_or(0);
+        let min_y = regions
+            .iter()
+            .map(|r| r.y as i64 * SUBPIXEL)
+            .min()
+            .unwrap_or(0);
+        let max_x = regions
+            .iter()
+            .map(|r| (r.x as i64 + r.width as i64) * SUBPIXEL - 1)
             .max()
             .unwrap_or(0)
             .max(min_x);
-        let max_y = displays
+        let max_y = regions
             .iter()
-            .map(|d| d.y.saturating_add(d.height as i32).saturating_sub(1))
+            .map(|r| (r.y as i64 + r.height as i64) * SUBPIXEL - 1)
             .max()
             .unwrap_or(0)
             .max(min_y);
@@ -87,11 +135,11 @@ impl UinputDevice {
         rel.insert(RelativeAxisCode::REL_HWHEEL);
         let abs_x = UinputAbsSetup::new(
             AbsoluteAxisCode::ABS_X,
-            AbsInfo::new(0, 0, max_x - min_x, 0, 0, 1),
+            AbsInfo::new(0, 0, (max_x - min_x) as i32, 0, 0, 1),
         );
         let abs_y = UinputAbsSetup::new(
             AbsoluteAxisCode::ABS_Y,
-            AbsInfo::new(0, 0, max_y - min_y, 0, 0, 1),
+            AbsInfo::new(0, 0, (max_y - min_y) as i32, 0, 0, 1),
         );
         let name = b"Omarchy Connect";
         let device = VirtualDevice::builder()
@@ -107,11 +155,11 @@ impl UinputDevice {
             .context("uinput wheel")?
             .build()
             .context("create uinput device")?;
-        let origins = displays.iter().map(|d| (d.id, (d.x, d.y))).collect();
+        let regions = regions.iter().map(|r| (r.id, *r)).collect();
         tracing::info!("uinput device ready");
         Ok(Self {
             device,
-            origins,
+            regions,
             min_x,
             min_y,
             max_x,
@@ -128,13 +176,12 @@ impl UinputDevice {
         let mut batch = Vec::new();
         match event {
             InputEvent::MouseMove { display_id, x, y } => {
-                let (ox, oy) = self
-                    .origins
-                    .get(display_id)
-                    .copied()
-                    .unwrap_or((self.min_x, self.min_y));
-                let gx = ox.saturating_add(*x as i32).clamp(self.min_x, self.max_x) - self.min_x;
-                let gy = oy.saturating_add(*y as i32).clamp(self.min_y, self.max_y) - self.min_y;
+                let (lx, ly) = match self.regions.get(display_id) {
+                    Some(region) => region.to_layout(*x, *y),
+                    None => (self.min_x, self.min_y),
+                };
+                let gx = (lx.clamp(self.min_x, self.max_x) - self.min_x) as i32;
+                let gy = (ly.clamp(self.min_y, self.max_y) - self.min_y) as i32;
                 batch.push(EvdevEvent::new(
                     EventType::ABSOLUTE.0,
                     AbsoluteAxisCode::ABS_X.0,
@@ -187,5 +234,28 @@ impl UinputDevice {
         ));
         self.device.emit(&batch).context("emit uinput")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Region, SUBPIXEL};
+
+    #[test]
+    fn scaled_pixels_map_to_logical_layout() {
+        let region = Region {
+            id: 1,
+            x: 1280,
+            y: 0,
+            width: 960,
+            height: 540,
+            pixel_width: 1920,
+            pixel_height: 1080,
+        };
+        assert_eq!(region.to_layout(0, 0), (1280 * SUBPIXEL, 0));
+        assert_eq!(
+            region.to_layout(960, 540),
+            ((1280 + 480) * SUBPIXEL, 270 * SUBPIXEL)
+        );
     }
 }
