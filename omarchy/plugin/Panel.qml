@@ -31,6 +31,8 @@ Panel {
   readonly property bool accessOn: running && unattended && pinSet
   readonly property var addresses: Array.isArray(info.addresses) ? info.addresses : []
   readonly property int port: info.port || 47921
+  readonly property int fps: info.fps || 15
+  readonly property int bitrateKbps: info.bitrate_kbps || 4000
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -83,6 +85,10 @@ Panel {
     }
     pinField.text = ""
     run(["pin", "set"], pin)
+  }
+
+  function setVideo(fps, bitrateKbps) {
+    run(["video", "--fps", String(fps), "--bitrate-kbps", String(bitrateKbps)])
   }
 
   function toggleUnattended() {
@@ -379,6 +385,92 @@ Panel {
               ip: String(modelData.ip || "")
               iface: String(modelData.interface || "")
             }
+          }
+        }
+
+        Column {
+          visible: root.loaded
+          width: parent.width
+          spacing: Style.space(8)
+
+          PanelSeparator { foreground: root.foreground }
+
+          PanelSectionHeader {
+            text: "VIDEO"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: "Frame rate"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            spacing: Style.space(6)
+            Repeater {
+              model: [15, 30, 60]
+              Button {
+                required property int modelData
+                text: modelData + " fps"
+                bordered: root.fps === modelData
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !root.busy
+                onClicked: root.setVideo(modelData, root.bitrateKbps)
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: "Bitrate"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            spacing: Style.space(6)
+            Button {
+              text: "4 Mb/s"
+              bordered: root.bitrateKbps === 4000
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: !root.busy
+              onClicked: root.setVideo(root.fps, 4000)
+            }
+            Button {
+              text: "8 Mb/s"
+              bordered: root.bitrateKbps === 8000
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: !root.busy
+              onClicked: root.setVideo(root.fps, 8000)
+            }
+            Button {
+              text: "12 Mb/s"
+              bordered: root.bitrateKbps === 12000
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: !root.busy
+              onClicked: root.setVideo(root.fps, 12000)
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: "Higher frame rate is smoother and lower latency. It applies the next time someone connects."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
         }
 

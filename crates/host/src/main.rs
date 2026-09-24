@@ -38,6 +38,13 @@ enum Command {
     },
     /// Turn unattended access on or off. The PIN is kept either way.
     Unattended { state: OnOff },
+    /// Set the frame rate and bitrate used by the next connection.
+    Video {
+        #[arg(long)]
+        fps: Option<u32>,
+        #[arg(long)]
+        bitrate_kbps: Option<u32>,
+    },
     /// End the current remote session. The host keeps listening.
     Disconnect,
     /// Forget the saved portal screen share so its picker appears next time.
@@ -104,6 +111,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Status { json }) => print_status(json),
         Some(Command::Pin { action }) => pin(action),
         Some(Command::Unattended { state }) => unattended(state),
+        Some(Command::Video { fps, bitrate_kbps }) => video(fps, bitrate_kbps),
         Some(Command::Disconnect) => disconnect(),
         Some(Command::ResetShare) => reset_share(),
     }
@@ -237,6 +245,29 @@ fn unattended(state: OnOff) -> anyhow::Result<()> {
         "Unattended access is {}.",
         if settings.unattended { "on" } else { "off" }
     );
+    Ok(())
+}
+
+fn video(fps: Option<u32>, bitrate_kbps: Option<u32>) -> anyhow::Result<()> {
+    let path = settings_path()?;
+    let mut settings = Settings::load(&path)?;
+    if let Some(fps) = fps {
+        if !(1..=60).contains(&fps) {
+            anyhow::bail!("fps must be from 1 to 60");
+        }
+        settings.fps = fps;
+    }
+    if let Some(bitrate_kbps) = bitrate_kbps {
+        if !(500..=50_000).contains(&bitrate_kbps) {
+            anyhow::bail!("bitrate must be from 500 to 50000 kb/s");
+        }
+        settings.bitrate_kbps = bitrate_kbps;
+    }
+    if fps.is_some() || bitrate_kbps.is_some() {
+        settings.save(&path)?;
+    }
+    let (fps, bitrate_kbps) = settings.video();
+    println!("Video is {fps} fps at {bitrate_kbps} kb/s. The next connection uses this.");
     Ok(())
 }
 

@@ -9,12 +9,37 @@ use std::path::Path;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+fn default_fps() -> u32 {
+    15
+}
+
+fn default_bitrate_kbps() -> u32 {
+    4000
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
     #[serde(default)]
     pub unattended: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
+    /// Capture and encode rate. Applied when the next client connects.
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    /// Encoder target in kilobits per second.
+    #[serde(default = "default_bitrate_kbps")]
+    pub bitrate_kbps: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            unattended: false,
+            pin: None,
+            fps: default_fps(),
+            bitrate_kbps: default_bitrate_kbps(),
+        }
+    }
 }
 
 impl Settings {
@@ -49,6 +74,11 @@ impl Settings {
         Ok(())
     }
 
+    /// Frame rate and bitrate for the next connection, clamped to a usable range.
+    pub fn video(&self) -> (u32, u32) {
+        (self.fps.clamp(1, 60), self.bitrate_kbps.clamp(500, 50_000))
+    }
+
     /// The PIN a client must prove, or `None` when unattended access is off.
     pub fn active_pin(&self) -> Option<&str> {
         if self.unattended {
@@ -73,12 +103,16 @@ mod tests {
         let settings = Settings {
             unattended: true,
             pin: Some("482913".into()),
+            fps: 60,
+            bitrate_kbps: 12_000,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), settings);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(settings.active_pin(), Some("482913"));
+        assert_eq!(settings.video(), (60, 12_000));
+        assert_eq!(Settings::default().video(), (15, 4_000));
         let off = Settings {
             unattended: false,
             ..settings

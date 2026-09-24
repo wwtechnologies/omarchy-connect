@@ -129,11 +129,17 @@ pub async fn run_host(
             _ = cancel.cancelled() => break,
             incoming = listener.accept() => {
                 let (tcp, peer) = incoming.context("accept")?;
-                tracing::info!(%peer, "client connected");
                 tcp.set_nodelay(true).ok();
+                let session_config = with_saved_video(&config);
+                tracing::info!(
+                    %peer,
+                    fps = session_config.fps,
+                    bitrate_kbps = session_config.bitrate_kbps,
+                    "client connected"
+                );
                 let session_cancel = cancel.child_token();
                 *current.lock().expect("current session") = Some(session_cancel.clone());
-                let result = handle_client(tcp, peer, &acceptor, &config, &mut lockout, &publisher, &session_cancel).await;
+                let result = handle_client(tcp, peer, &acceptor, &session_config, &mut lockout, &publisher, &session_cancel).await;
                 *current.lock().expect("current session") = None;
                 if let Err(err) = &result {
                     tracing::warn!(error = %err, "session ended");
@@ -150,6 +156,26 @@ pub async fn run_host(
     }
     publisher.clear();
     Ok(())
+}
+
+/// Frame rate and bitrate from the bar, falling back to the process flags.
+fn with_saved_video(config: &HostConfig) -> HostConfig {
+    let mut config = config.clone();
+    let Some(path) = config.settings_path.clone() else {
+        return config;
+    };
+    if !path.exists() {
+        return config;
+    }
+    match Settings::load(&path) {
+        Ok(settings) => {
+            let (fps, bitrate) = settings.video();
+            config.fps = fps;
+            config.bitrate_kbps = bitrate;
+        }
+        Err(err) => tracing::warn!(error = %err, "video settings"),
+    }
+    config
 }
 
 /// `omarchy-connect disconnect` sends SIGUSR1; it ends the current session

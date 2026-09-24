@@ -24,6 +24,8 @@ pub struct Report {
     pub last_error: Option<String>,
     pub input_ready: bool,
     pub share_saved: bool,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
     pub settings_error: Option<String>,
 }
 
@@ -64,6 +66,8 @@ pub fn report(settings_path: &Path, state_path: &Path, token_path: Option<&Path>
         last_error: live.as_ref().and_then(|live| live.last_error.clone()),
         input_ready: live.as_ref().is_some_and(|live| live.input_ready),
         share_saved: token_path.is_some_and(Path::exists),
+        fps: settings.video().0,
+        bitrate_kbps: settings.video().1,
         settings_error,
     }
 }
@@ -131,6 +135,11 @@ impl std::fmt::Display for Report {
             (false, _) => "off",
         };
         writeln!(f, "Unattended access: {access}")?;
+        writeln!(
+            f,
+            "Video: {} fps at {} kb/s",
+            self.fps, self.bitrate_kbps
+        )?;
         if self.locked_secs > 0 {
             writeln!(f, "Locked for {} s after wrong PINs", self.locked_secs)?;
         }

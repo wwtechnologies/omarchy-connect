@@ -30,6 +30,7 @@ Click the icon to open the panel. It shows:
 - Whether the host is running, waiting, or connected, and who is connected. **Disconnect** ends the session and the host keeps listening.
 - The addresses to type on the client. Click one to copy it.
 - The unattended access PIN. Saving a PIN turns unattended access on. The switch in the header turns access off without forgetting the PIN. **Remove PIN** forgets it.
+- Video frame rate (15, 30, or 60) and bitrate (4, 8, or 12 Mb/s). The host uses the new values the next time a client connects.
 - **Pick screens again**, only when the host fell back to the portal picker and saved a choice.
 
 The icon is dim when access is off and highlighted while a client is connected. A desktop notification appears whenever a session starts.
@@ -49,6 +50,7 @@ omarchy-connect status            # add --json for the bar
 omarchy-connect pin set           # reads the PIN from stdin, or: pin set 482913
 omarchy-connect pin clear
 omarchy-connect unattended on|off
+omarchy-connect video --fps 60 --bitrate-kbps 12000
 omarchy-connect disconnect
 omarchy-connect reset-share       # portal fallback only: show the picker again
 journalctl --user -u omarchy-connect -f

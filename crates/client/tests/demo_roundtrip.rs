@@ -136,6 +136,7 @@ async fn unattended_settings_gate_the_pin() {
     Settings {
         unattended: true,
         pin: Some(PIN.into()),
+        ..Settings::default()
     }
     .save(&settings_path)
     .unwrap();
@@ -151,6 +152,7 @@ async fn unattended_settings_gate_the_pin() {
     Settings {
         unattended: false,
         pin: Some(PIN.into()),
+        ..Settings::default()
     }
     .save(&settings_path)
     .unwrap();
