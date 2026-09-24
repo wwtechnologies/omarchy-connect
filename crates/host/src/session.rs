@@ -531,7 +531,6 @@ async fn drive_session(
     });
 
     let mut encoders: HashMap<u32, Encoder> = HashMap::new();
-    let mut bitrate = Bitrate::new(config.bitrate_kbps);
     let mut pts = 0u64;
     let mut tick =
         tokio::time::interval(Duration::from_millis(1000 / u64::from(config.fps.max(1))));
@@ -548,7 +547,7 @@ async fn drive_session(
             _ = tick.tick(), if synthetic.is_some() => {
                 if let Some(desktop) = synthetic.as_mut() {
                     for frame in desktop.render() {
-                        send_frame(&mut encoders, &video_tx, &frame, pts, config.fps, &mut bitrate).await?;
+                        send_frame(&mut encoders, &video_tx, &frame, pts, config.fps, config.bitrate_kbps).await?;
                     }
                     pts = pts.wrapping_add(1000 / u64::from(config.fps.max(1)));
                 }
@@ -563,7 +562,7 @@ async fn drive_session(
                         let _ = ctrl_tx.send(Message::Displays { displays: displays.clone() }).await;
                     }
                 }
-                send_frame(&mut encoders, &video_tx, &frame, pts, config.fps, &mut bitrate).await?;
+                send_frame(&mut encoders, &video_tx, &frame, pts, config.fps, config.bitrate_kbps).await?;
                 pts = pts.wrapping_add(1);
             }
         }
@@ -588,9 +587,8 @@ async fn send_frame(
     frame: &RawFrame,
     pts: u64,
     fps: u32,
-    bitrate: &mut Bitrate,
+    bitrate_kbps: u32,
 ) -> anyhow::Result<()> {
-    let bitrate_kbps = bitrate.choose(frame.width, frame.height, fps);
     if !encoders.contains_key(&frame.display_id) {
         encoders.insert(
             frame.display_id,
@@ -599,7 +597,6 @@ async fn send_frame(
     }
     let encoder = encoders.get_mut(&frame.display_id).expect("encoder");
     let encoded = encoder.encode(&frame.i420, pts)?;
-    let mut waited = Duration::ZERO;
     for packet in encoded {
         let msg = Message::Video {
             display_id: frame.display_id,
@@ -609,92 +606,11 @@ async fn send_frame(
         };
         // Blocking keeps the H.264 sequence intact. The capture side already
         // replaced any older picture, so this wait is one frame, not a backlog.
-        let started = Instant::now();
         if video_tx.send(msg).await.is_err() {
             break;
         }
-        waited += started.elapsed();
-    }
-    if bitrate.observe(waited, fps) {
-        encoders.clear();
     }
     Ok(())
-}
-
-/// Fixed kilobits per second, or automatic. Automatic starts from the monitor
-/// size and steps down when the client cannot take frames as fast as they are
-/// produced, then back up once there is spare time.
-struct Bitrate {
-    auto: bool,
-    kbps: u32,
-    ceiling: u32,
-    late: u32,
-    spare: u32,
-}
-
-impl Bitrate {
-    fn new(setting: u32) -> Self {
-        if setting == 0 {
-            Self {
-                auto: true,
-                kbps: 0,
-                ceiling: 50_000,
-                late: 0,
-                spare: 0,
-            }
-        } else {
-            let kbps = setting.clamp(500, 50_000);
-            Self {
-                auto: false,
-                kbps,
-                ceiling: kbps,
-                late: 0,
-                spare: 0,
-            }
-        }
-    }
-
-    fn choose(&mut self, width: u32, height: u32, fps: u32) -> u32 {
-        if self.kbps == 0 {
-            let pixels = u64::from(width) * u64::from(height) * u64::from(fps.max(1));
-            // About 0.2 bits per pixel. 1080p60 lands near 25 Mb/s, 1440p60 near 44.
-            self.kbps = u32::try_from(pixels * 20 / 100_000)
-                .unwrap_or(50_000)
-                .clamp(8_000, self.ceiling);
-            tracing::info!(kbps = self.kbps, "automatic bitrate");
-        }
-        self.kbps
-    }
-
-    /// Returns true when the encoder should be reopened at the new rate.
-    fn observe(&mut self, waited: Duration, fps: u32) -> bool {
-        if !self.auto {
-            return false;
-        }
-        let budget = Duration::from_millis(1000 / u64::from(fps.max(1)));
-        if waited > budget {
-            self.spare = 0;
-            self.late = self.late.saturating_add(1);
-            if self.late >= 6 && self.kbps > 4_000 {
-                self.kbps = (self.kbps * 3 / 4).max(4_000);
-                self.late = 0;
-                tracing::info!(kbps = self.kbps, "lowering bitrate, the client is behind");
-                return true;
-            }
-        } else {
-            self.late = 0;
-            self.spare = self.spare.saturating_add(1);
-            let settle = fps.max(1).saturating_mul(8);
-            if self.spare >= settle && self.kbps < self.ceiling {
-                let raised = self.kbps.saturating_mul(5) / 4;
-                self.kbps = raised.min(self.ceiling);
-                self.spare = 0;
-                tracing::info!(kbps = self.kbps, "raising bitrate");
-                return true;
-            }
-        }
-        false
-    }
 }
 
 fn build_injector(mode: InputMode, demo: bool, regions: &[Region]) -> Injector {

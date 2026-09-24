@@ -93,7 +93,7 @@ impl X264Encoder {
         let mut encoder = Setup::preset(Preset::Ultrafast, Tune::None, true, true)
             .fps(fps, 1)
             .annexb(true)
-            .bitrate(bitrate_kbps.max(200) as i32)
+            .bitrate(software_kbps(bitrate_kbps) as i32)
             .max_keyframe_interval((fps * 2) as i32)
             .min_keyframe_interval(fps as i32)
             .scenecut_threshold(0)
@@ -154,6 +154,29 @@ impl X264Encoder {
     }
 }
 
+/// Lower QP is sharper. Auto and the higher bar settings stay in a range
+/// that keeps text clear without asking the GPU to emit a constant flood of bits.
+fn qp_for_setting(bitrate_kbps: u32) -> u32 {
+    match bitrate_kbps {
+        0 => 18,
+        n if n >= 40_000 => 16,
+        n if n >= 20_000 => 18,
+        n if n >= 10_000 => 20,
+        _ => 23,
+    }
+}
+
+/// Software x264 has no constant-quality control here, so map the same
+/// settings onto a modest rate. Ultrafast at 50 Mb/s would pin the CPU.
+fn software_kbps(bitrate_kbps: u32) -> u32 {
+    match bitrate_kbps {
+        0 => 8_000,
+        n if n >= 40_000 => 16_000,
+        n if n >= 20_000 => 12_000,
+        n => n.clamp(500, 12_000),
+    }
+}
+
 struct VaapiEncoder {
     child: Child,
     stdin: ChildStdin,
@@ -187,9 +210,9 @@ impl VaapiEncoder {
         let gop = (fps.max(1) * 2).to_string();
         let size = format!("{width}x{height}");
         let rate = fps.max(1).to_string();
-        let bitrate = format!("{}k", bitrate_kbps.max(500));
-        // One frame of VBV so a higher rate does not sit in an encoder buffer.
-        let bufsize = format!("{}k", (bitrate_kbps.max(500) / fps.max(1)).max(100));
+        // Constant quality. A bitrate target made VAAPI emit that many bits on
+        // every frame, which ran hot, and a one-frame buffer smeared detail.
+        let qp = qp_for_setting(bitrate_kbps).to_string();
         let device = device.display().to_string();
         let mut child = Command::new("ffmpeg")
             .args([
@@ -226,12 +249,10 @@ impl VaapiEncoder {
                 "1",
                 "-g",
                 &gop,
-                "-b:v",
-                &bitrate,
-                "-maxrate",
-                &bitrate,
-                "-bufsize",
-                &bufsize,
+                "-rc_mode",
+                "CQP",
+                "-qp",
+                &qp,
                 "-f",
                 "h264",
                 "pipe:1",

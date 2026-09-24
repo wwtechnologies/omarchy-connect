@@ -30,7 +30,7 @@ Click the icon to open the panel. It shows:
 - Whether the host is running, waiting, or connected, and who is connected. **Disconnect** ends the session and the host keeps listening.
 - The addresses to type on the client. Click one to copy it.
 - The unattended access PIN. Saving a PIN turns unattended access on. The switch in the header turns access off without forgetting the PIN. **Remove PIN** forgets it.
-- Video frame rate (15, 30, or 60) and bitrate (Auto, 12, 25, or 50 Mb/s). Auto starts from the monitor size and steps down when the client falls behind. A fixed rate is used the next time a client connects.
+- Video frame rate (15, 30, or 60) and quality (Auto, 12, 25, or 50). These are constant-quality levels, not a filled pipe: Auto stays sharp while a still screen uses little GPU, and the higher steps are sharper. The next connection uses the new value.
 - **Pick screens again**, only when the host fell back to the portal picker and saved a choice.
 
 The icon is dim when access is off and highlighted while a client is connected. A desktop notification appears whenever a session starts.

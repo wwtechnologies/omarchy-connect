@@ -476,7 +476,7 @@ Panel {
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: "Auto starts near 25 Mb/s for 1080p and steps down if the client falls behind. A fixed rate applies the next time someone connects."
+            text: "Auto keeps text sharp and lets a still screen use very little GPU. Higher settings are sharper. It applies the next time someone connects."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
