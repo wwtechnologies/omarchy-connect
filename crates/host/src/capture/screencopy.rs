@@ -294,13 +294,46 @@ impl Grabber {
         Ok(())
     }
 
-    /// Asks every output for one frame and publishes each as soon as it is ready.
-    fn round_send(&mut self, ids: &[(usize, u32, u32)], tx: &FrameInbox) -> anyhow::Result<()> {
+    /// Asks every output for one frame and waits for all of them without
+    /// publishing. `connect` uses it to learn each output's buffer size.
+    fn round(&mut self) -> anyhow::Result<()> {
+        let deadline = self.begin_round();
+        while self
+            .state
+            .outputs
+            .iter()
+            .any(|o| o.pending == Pending::Waiting)
+        {
+            if !self.dispatch_until(deadline)? {
+                break;
+            }
+        }
+        self.end_round();
+        Ok(())
+    }
+
+    fn begin_round(&mut self) -> Instant {
         for (index, output) in self.state.outputs.iter_mut().enumerate() {
             output.pending = Pending::Waiting;
             output.frame = Some(self.manager.capture_output(1, &output.wl, &self.qh, index));
         }
-        let deadline = Instant::now() + ROUND_TIMEOUT;
+        Instant::now() + ROUND_TIMEOUT
+    }
+
+    fn end_round(&mut self) {
+        for output in &mut self.state.outputs {
+            if output.pending == Pending::Waiting {
+                output.pending = Pending::Failed;
+            }
+            if let Some(frame) = output.frame.take() {
+                frame.destroy();
+            }
+        }
+    }
+
+    /// Asks every output for one frame and publishes each as soon as it is ready.
+    fn round_send(&mut self, ids: &[(usize, u32, u32)], tx: &FrameInbox) -> anyhow::Result<()> {
+        let deadline = self.begin_round();
         let mut sent = vec![false; self.state.outputs.len()];
         while sent.iter().any(|done| !done) {
             self.publish_ready(ids, tx, &mut sent);
@@ -312,14 +345,7 @@ impl Grabber {
             }
         }
         self.publish_ready(ids, tx, &mut sent);
-        for output in &mut self.state.outputs {
-            if output.pending == Pending::Waiting {
-                output.pending = Pending::Failed;
-            }
-            if let Some(frame) = output.frame.take() {
-                frame.destroy();
-            }
-        }
+        self.end_round();
         Ok(())
     }
 
